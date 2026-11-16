@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Friendly Fluency Hub</string>
+    <string name="title_activity_main">Friendly Fluency Hub</string>
+    <string name="package_name">com.english.fluency.hub</string>
+    <string name="custom_url_scheme">com.english.fluency.hub</string>
+</resources>

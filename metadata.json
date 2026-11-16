@@ -1,0 +1,6 @@
+{
+  "name": "Friendly Fluency Hub",
+  "description": "منصة متكاملة لتعلم اللغة الإنجليزية من المستوى A1 إلى C2 مع اختبار النطق، التتبع الذكي، المنافسات، والمعلم الذكي بالعربية السودانية.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

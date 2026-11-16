@@ -1,0 +1,61 @@
+@import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+  --font-sans: "Cairo", "Plus Jakarta Sans", system-ui, sans-serif;
+  --font-en: "Plus Jakarta Sans", system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, monospace;
+}
+
+:root {
+  --accent-primary: #1a6fa0;
+  --accent-primary-hover: #155a82;
+  --accent-soft: #e6f1f8;
+  --accent-text: #155a82;
+}
+
+[data-theme="emerald"] {
+  --accent-primary: #0f766e;
+  --accent-primary-hover: #115e59;
+  --accent-soft: #e6f6f4;
+  --accent-text: #115e59;
+}
+
+[data-theme="indigo"] {
+  --accent-primary: #4338ca;
+  --accent-primary-hover: #3730a3;
+  --accent-soft: #eef2ff;
+  --accent-text: #3730a3;
+}
+
+[data-theme="amber"] {
+  --accent-primary: #b45309;
+  --accent-primary-hover: #92400e;
+  --accent-soft: #fef3c7;
+  --accent-text: #92400e;
+}
+
+html,
+body {
+  margin: 0;
+  font-family: var(--font-sans);
+  -webkit-tap-highlight-color: transparent;
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+.font-en {
+  font-family: var(--font-en);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
