@@ -17,6 +17,7 @@ import {
   Settings,
   Sparkles,
   Swords,
+  Table2,
   Trophy,
   Unlock,
   UploadCloud,
@@ -27,8 +28,10 @@ import {
 import type {
   AppState,
   CEFRLevelId,
+  FriendComparison,
   Lesson,
   MatchRecord,
+  PeerInfo,
   Rival,
   SavedWord,
   ShopItem,
@@ -54,6 +57,7 @@ import {
   loadStateFromIndexedDB,
   loadStateFromLocal,
   parseFriendInviteCode,
+  peerToFriendComparison,
   persistState,
   removeOfflineLevelBundle,
   saveOfflineLevelBundle,
@@ -71,6 +75,7 @@ import { AITeacherModal } from './components/AITeacherModal';
 import { OfflineStatusNotice, PWAInstallButton } from './components/PWAInstallBanner';
 import { SpeechErrorBanner } from './components/SpeakButton';
 import { IncomingChallengeBanner, MultiplayerHubModal } from './components/MultiplayerHubModal';
+import { FriendsComparisonModal } from './components/FriendsComparisonModal';
 import type { PronunciationResult } from './components/PronunciationLab';
 
 type NavTab = 'home' | 'levels' | 'analytics' | 'leaderboard' | 'shop' | 'settings';
@@ -97,6 +102,7 @@ export default function App() {
   const [nameInput, setNameInput] = useState(state.profile.name);
   const [realtime, setRealtime] = useState<RealtimeState>(() => realtimeClient.getSnapshot());
   const [multiplayerTab, setMultiplayerTab] = useState<'wifi' | 'online' | 'teams' | null>(null);
+  const [friendsModalOpen, setFriendsModalOpen] = useState(false);
   const [copiedPrivateCode, setCopiedPrivateCode] = useState(false);
 
   const pushToast = (text: string, tone: ToastMessage['tone'] = 'info') => {
@@ -165,12 +171,18 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    const passedLessonsCount = Object.values(state.completedLessons).filter((v) => v >= 70).length;
     realtimeClient.connect({
       privateCode: state.profile.privateCode,
       name: state.profile.name,
       avatarId: state.profile.avatarId,
       levelId: currentStudentLevel,
       lanServerUrl: state.profile.lanServerUrl,
+      xp: state.xp,
+      streak: state.streak,
+      completedLessons: passedLessonsCount,
+      avgSkill: getAverageSkillAccuracy(state),
+      unlockedLevels: state.unlockedLevels,
     });
   }, [
     state.profile.privateCode,
@@ -178,6 +190,11 @@ export default function App() {
     state.profile.avatarId,
     currentStudentLevel,
     state.profile.lanServerUrl,
+    state.xp,
+    state.streak,
+    state.completedLessons,
+    state.skills,
+    state.unlockedLevels,
   ]);
 
   // Detect rank crossing whenever standings change
@@ -519,20 +536,109 @@ export default function App() {
     }
   };
 
-  const handleAddFriendComparison = (code: string): { ok: boolean; message: string } => {
-    try {
-      const friend = parseFriendInviteCode(code);
-      setState((prev) => {
-        const filtered = prev.friends.filter((f) => f.name !== friend.name);
-        return {
-          ...prev,
-          friends: [friend, ...filtered].slice(0, 10),
-        };
+  const upsertFriendComparison = (friend: FriendComparison) => {
+    setState((prev) => {
+      const filtered = prev.friends.filter((f) => {
+        if (friend.privateCode && f.privateCode) {
+          return f.privateCode !== friend.privateCode;
+        }
+        return f.code !== friend.code && f.name !== friend.name;
       });
-      return { ok: true, message: `تمت إضافة "${friend.name}" للمقارنة المباشرة!` };
-    } catch (err) {
-      return { ok: false, message: err instanceof Error ? err.message : 'تعذر قراءة كود الصديق.' };
+      return {
+        ...prev,
+        friends: [friend, ...filtered].slice(0, 20),
+      };
+    });
+  };
+
+  const handleAddFriendFromPeer = (peer: PeerInfo): { ok: boolean; message: string } => {
+    if (peer.privateCode === state.profile.privateCode) {
+      return { ok: false, message: 'هذا رقمك الخاص! لا يمكنك إضافة نفسك كصديق.' };
     }
+    const friend = peerToFriendComparison(peer);
+    upsertFriendComparison(friend);
+    pushToast(`تمت إضافة "${friend.name}" إلى قائمة الأصدقاء والمقارنة!`, 'success');
+    return { ok: true, message: `تمت إضافة "${friend.name}" (${friend.privateCode}) بنجاح!` };
+  };
+
+  const handleAddFriendByAnyCode = async (codeInput: string): Promise<{ ok: boolean; message: string }> => {
+    const clean = codeInput.trim();
+    if (!clean) {
+      return { ok: false, message: 'أدخل الرقم الخاص (6 أرقام) أو كود المشاركة FFH-.' };
+    }
+
+    if (clean.startsWith('FFH-')) {
+      try {
+        const friend = parseFriendInviteCode(clean);
+        if (friend.privateCode && friend.privateCode === state.profile.privateCode) {
+          return { ok: false, message: 'هذا كودك الشخصي! لا يمكنك إضافة نفسك.' };
+        }
+        upsertFriendComparison(friend);
+        pushToast(`تمت إضافة "${friend.name}" للمقارنة!`, 'success');
+        return { ok: true, message: `تمت إضافة "${friend.name}" للمقارنة المباشرة!` };
+      } catch (err) {
+        return { ok: false, message: err instanceof Error ? err.message : 'تعذر قراءة كود الصديق.' };
+      }
+    }
+
+    const sixDigits = clean.replace(/\D/g, '');
+    if (sixDigits.length !== 6) {
+      return { ok: false, message: 'أدخل رقماً خاصاً صحيحاً من 6 أرقام أو كود FFH- كامل.' };
+    }
+    if (sixDigits === state.profile.privateCode) {
+      return { ok: false, message: 'هذا رقمك الخاص! أدخل رقم صديقك المكون من 6 أرقام.' };
+    }
+
+    const peer = await realtimeClient.lookupPeer(sixDigits);
+    if (!peer || peer.status === 'offline') {
+      return {
+        ok: false,
+        message:
+          'لم يُعثر على صديق متصل بهذا الرقم حالياً. تأكد أن صديقك فتح التطبيق على نفس الواي فاي أو الإنترنت، أو استخدم كود FFH- الأوفلاين.',
+      };
+    }
+
+    const friend = peerToFriendComparison(peer);
+    upsertFriendComparison(friend);
+    pushToast(`تمت إضافة "${friend.name}" (${sixDigits}) لقائمة الأصدقاء!`, 'success');
+    return {
+      ok: true,
+      message: `تمت إضافة "${friend.name}" (${sixDigits} · المستوى ${friend.level}) لقائمة الأصدقاء والمقارنة!`,
+    };
+  };
+
+  const handleRemoveFriend = (codeOrPrivateCode: string) => {
+    setState((prev) => ({
+      ...prev,
+      friends: prev.friends.filter(
+        (f) => f.code !== codeOrPrivateCode && f.privateCode !== codeOrPrivateCode,
+      ),
+    }));
+    pushToast('تمت إزالة الصديق من القائمة.', 'info');
+  };
+
+  const handleRefreshFriend = async (privateCode: string): Promise<{ ok: boolean; message: string }> => {
+    const clean = privateCode.trim();
+    if (!/^\d{6}$/.test(clean)) {
+      return { ok: false, message: 'لا يوجد رقم خاص من 6 أرقام لتحديث هذا الصديق.' };
+    }
+    const peer = await realtimeClient.lookupPeer(clean);
+    if (!peer || peer.status === 'offline') {
+      return { ok: false, message: `الصديق (${clean}) غير متصل حالياً لتحديث إحصائياته.` };
+    }
+    const updated = peerToFriendComparison(peer);
+    upsertFriendComparison(updated);
+    return { ok: true, message: `تم تحديث تقدم "${updated.name}" بنجاح.` };
+  };
+
+  const handleChallengeSavedFriend = (privateCode: string) => {
+    const clean = privateCode.trim();
+    if (!/^\d{6}$/.test(clean)) return;
+    setFriendsModalOpen(false);
+    setMultiplayerTab('online');
+    void realtimeClient.lookupPeer(clean);
+    void realtimeClient.sendChallenge(clean, 'online', true);
+    pushToast(`تم إرسال طلب التحدي إلى الصديق (${clean})!`, 'info');
   };
 
   const handleImportJSON = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -1030,6 +1136,22 @@ export default function App() {
                         <span>الفرق الجماعية (1v1 - 4v4)</span>
                       </button>
                     </div>
+
+                    <div className="mt-3 flex flex-wrap items-center justify-between gap-2 border-t border-slate-100 pt-3">
+                      <span className="text-xs font-semibold text-slate-600">
+                        أضف أصدقاءك بالرقم الخاص (6 أرقام) وقارن مستوياتهم وتقدمهم معك لحظياً.
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => setFriendsModalOpen(true)}
+                        className="inline-flex min-h-[40px] items-center gap-2 rounded-xl border border-slate-200 bg-white px-3.5 py-2 text-xs font-extrabold text-slate-900 transition hover:bg-slate-50"
+                      >
+                        <Table2 className="h-4 w-4 text-[var(--accent-primary)]" />
+                        <span>
+                          جدول مقارنة الأصدقاء ({state.friends.length})
+                        </span>
+                      </button>
+                    </div>
                   </div>
 
                   {/* Quick Stats Summary */}
@@ -1277,7 +1399,10 @@ export default function App() {
                     setDailyChallengeRival(RIVALS[Math.floor(Math.random() * RIVALS.length)])
                   }
                   onSimulateRivalTick={handleSimulateRivalTick}
-                  onAddFriendComparison={handleAddFriendComparison}
+                  onAddFriendComparison={handleAddFriendByAnyCode}
+                  onRemoveFriend={handleRemoveFriend}
+                  onOpenComparisonModal={() => setFriendsModalOpen(true)}
+                  onChallengeFriend={handleChallengeSavedFriend}
                 />
               )}
 
@@ -1571,9 +1696,23 @@ export default function App() {
           onRegenerateCode={handleRegeneratePrivateCode}
           onUpdateLanUrl={handleUpdateLanUrl}
           onSaveMatchResult={handleSaveMatchResult}
+          onAddFriendByAnyCode={handleAddFriendByAnyCode}
+          onAddFriendFromPeer={handleAddFriendFromPeer}
+          onOpenComparisonModal={() => setFriendsModalOpen(true)}
           onClose={() => setMultiplayerTab(null)}
         />
       )}
+
+      {/* Detailed Friends Levels & Progress Comparison Modal */}
+      <FriendsComparisonModal
+        isOpen={friendsModalOpen}
+        state={state}
+        onClose={() => setFriendsModalOpen(false)}
+        onAddFriendByAnyCode={handleAddFriendByAnyCode}
+        onRemoveFriend={handleRemoveFriend}
+        onRefreshFriend={handleRefreshFriend}
+        onChallengeFriend={handleChallengeSavedFriend}
+      />
 
       {/* Global Speech Engine Error Banner */}
       <SpeechErrorBanner />

@@ -1,15 +1,21 @@
 package com.english.fluency.hub;
 
+import android.Manifest;
 import android.content.Intent;
+import android.content.pm.PackageManager;
 import android.os.Bundle;
 import android.provider.Settings;
 import android.speech.tts.TextToSpeech;
 import android.speech.tts.UtteranceProgressListener;
 import android.webkit.JavascriptInterface;
+import androidx.annotation.NonNull;
+import androidx.core.app.ActivityCompat;
+import androidx.core.content.ContextCompat;
 import com.getcapacitor.BridgeActivity;
 import java.util.Locale;
 
 public class MainActivity extends BridgeActivity {
+    private static final int REQ_RECORD_AUDIO = 2042;
     private TextToSpeech tts;
     private boolean ttsReady = false;
     private String activeSpeechId = "";
@@ -46,6 +52,34 @@ public class MainActivity extends BridgeActivity {
         if (getBridge() != null && getBridge().getWebView() != null) {
             getBridge().getWebView().addJavascriptInterface(new AndroidTTSBridge(), "AndroidTTS");
         }
+    }
+
+    @Override
+    public void onResume() {
+        super.onResume();
+        dispatchMicPermissionState();
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, @NonNull String[] permissions, @NonNull int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == REQ_RECORD_AUDIO) {
+            dispatchMicPermissionState();
+        }
+    }
+
+    private boolean isMicGranted() {
+        return ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED;
+    }
+
+    private void dispatchMicPermissionState() {
+        boolean granted = isMicGranted();
+        runOnUiThread(() -> {
+            if (getBridge() != null && getBridge().getWebView() != null) {
+                String js = "window.__onAndroidMicPermission && window.__onAndroidMicPermission(" + granted + ");";
+                getBridge().getWebView().evaluateJavascript(js, null);
+            }
+        });
     }
 
     private void dispatchTTSEvent(String speechId, String type, String detail) {
@@ -142,6 +176,26 @@ public class MainActivity extends BridgeActivity {
                     intent.setData(android.net.Uri.parse("package:" + getPackageName()));
                     startActivity(intent);
                 } catch (Exception ignored) {}
+            });
+        }
+
+        @JavascriptInterface
+        public boolean hasRecordAudioPermission() {
+            return isMicGranted();
+        }
+
+        @JavascriptInterface
+        public void requestRecordAudioPermission() {
+            runOnUiThread(() -> {
+                if (isMicGranted()) {
+                    dispatchMicPermissionState();
+                } else {
+                    ActivityCompat.requestPermissions(
+                        MainActivity.this,
+                        new String[] { Manifest.permission.RECORD_AUDIO, Manifest.permission.MODIFY_AUDIO_SETTINGS },
+                        REQ_RECORD_AUDIO
+                    );
+                }
             });
         }
     }

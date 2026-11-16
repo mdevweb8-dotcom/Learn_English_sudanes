@@ -15,6 +15,11 @@ export interface RealtimeState {
   registeredCode: string | null;
   codeConflictError: string | null;
   wifiPeers: PeerInfo[];
+  wifiLoading: boolean;
+  wifiError: string | null;
+  searchResults: PeerInfo[];
+  searchingPeers: boolean;
+  searchError: string | null;
   lookedUpPeer: PeerInfo | null;
   lookupError: string | null;
   outgoingInvite: ChallengeInvite | null;
@@ -27,6 +32,19 @@ export interface RealtimeState {
   chatClosedMessage: string | null;
 }
 
+export interface RealtimeProfilePayload {
+  privateCode: string;
+  name: string;
+  avatarId: string;
+  levelId: CEFRLevelId;
+  xp?: number;
+  streak?: number;
+  completedLessons?: number;
+  avgSkill?: number;
+  unlockedLevels?: CEFRLevelId[];
+  lanServerUrl?: string;
+}
+
 type Listener = (state: RealtimeState) => void;
 
 class RealtimeClient {
@@ -34,15 +52,10 @@ class RealtimeClient {
   private listeners = new Set<Listener>();
   private webrtcSignalHandlers = new Set<(fromCode: string, signal: unknown) => void>();
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private retryDelay = 1200;
   private shouldRun = false;
-  private lastProfile: {
-    privateCode: string;
-    name: string;
-    avatarId: string;
-    levelId: CEFRLevelId;
-    lanServerUrl?: string;
-  } | null = null;
+  private lastProfile: RealtimeProfilePayload | null = null;
 
   private state: RealtimeState = {
     connected: false,
@@ -50,6 +63,11 @@ class RealtimeClient {
     registeredCode: null,
     codeConflictError: null,
     wifiPeers: [],
+    wifiLoading: false,
+    wifiError: null,
+    searchResults: [],
+    searchingPeers: false,
+    searchError: null,
     lookedUpPeer: null,
     lookupError: null,
     outgoingInvite: null,
@@ -106,21 +124,41 @@ class RealtimeClient {
     return `${proto}//${window.location.host}/ws`;
   }
 
-  public connect(profile: {
-    privateCode: string;
-    name: string;
-    avatarId: string;
-    levelId: CEFRLevelId;
-    lanServerUrl?: string;
-  }) {
+  private resolveHttpBase(lanServerUrl?: string): string {
+    const custom = (lanServerUrl || '').trim();
+    if (custom) {
+      if (custom.startsWith('http://') || custom.startsWith('https://')) {
+        return custom.replace(/\/ws$/, '').replace(/\/$/, '');
+      }
+      if (custom.startsWith('ws://') || custom.startsWith('wss://')) {
+        return custom.replace(/^ws/, 'http').replace(/\/ws$/, '').replace(/\/$/, '');
+      }
+      return `http://${custom.replace(/\/$/, '')}`;
+    }
+    if (window.location.protocol === 'capacitor:' || window.location.protocol === 'file:') {
+      return '';
+    }
+    return window.location.origin;
+  }
+
+  public connect(profile: RealtimeProfilePayload) {
     const urlChanged = this.lastProfile?.lanServerUrl !== profile.lanServerUrl;
-    const codeChanged = this.lastProfile?.privateCode !== profile.privateCode;
+    const statsOrIdentityChanged =
+      this.lastProfile?.privateCode !== profile.privateCode ||
+      this.lastProfile?.name !== profile.name ||
+      this.lastProfile?.avatarId !== profile.avatarId ||
+      this.lastProfile?.levelId !== profile.levelId ||
+      this.lastProfile?.xp !== profile.xp ||
+      this.lastProfile?.streak !== profile.streak ||
+      this.lastProfile?.completedLessons !== profile.completedLessons;
+
     this.lastProfile = profile;
     this.shouldRun = true;
+    this.ensureHeartbeat();
 
     if (this.ws && this.ws.readyState === WebSocket.OPEN && !urlChanged) {
       if (
-        codeChanged ||
+        statsOrIdentityChanged ||
         this.state.registeredCode !== profile.privateCode ||
         this.state.codeConflictError
       ) {
@@ -141,7 +179,52 @@ class RealtimeClient {
       this.ws = null;
     }
 
-    this.openSocket();
+    if (!this.ws || this.ws.readyState === WebSocket.CLOSED) {
+      this.openSocket();
+    }
+  }
+
+  private ensureHeartbeat() {
+    if (this.heartbeatTimer) return;
+    this.heartbeatTimer = setInterval(() => {
+      if (!this.shouldRun || !this.lastProfile) return;
+      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+        void this.sendHttpHeartbeat(true);
+      }
+    }, 6000);
+  }
+
+  private async sendHttpHeartbeat(httpOnly: boolean) {
+    if (!this.lastProfile) return;
+    const base = this.resolveHttpBase(this.lastProfile.lanServerUrl);
+    if (!base) return;
+    try {
+      const res = await fetch(`${base}/api/peers/heartbeat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...this.lastProfile, httpOnly }),
+      });
+      if (res.status === 409) {
+        const data = (await res.json()) as { error?: string };
+        this.setState({
+          registeredCode: null,
+          codeConflictError: data.error || 'تعارض في الرقم الخاص على الشبكة',
+        });
+        return;
+      }
+      if (!res.ok) return;
+      const data = (await res.json()) as { events?: Array<Record<string, unknown>> };
+      if (!this.state.connected && !this.state.registeredCode) {
+        this.setState({ registeredCode: this.lastProfile.privateCode, codeConflictError: null });
+      }
+      if (Array.isArray(data.events)) {
+        for (const ev of data.events) {
+          this.handleMessage(ev);
+        }
+      }
+    } catch {
+      // Offline / unreachable server
+    }
   }
 
   private openSocket() {
@@ -162,10 +245,7 @@ class RealtimeClient {
         if (this.lastProfile) {
           this.send({
             type: 'register',
-            privateCode: this.lastProfile.privateCode,
-            name: this.lastProfile.name,
-            avatarId: this.lastProfile.avatarId,
-            levelId: this.lastProfile.levelId,
+            ...this.lastProfile,
           });
         }
       };
@@ -180,7 +260,9 @@ class RealtimeClient {
       };
 
       ws.onclose = () => {
+        if (this.ws === ws) this.ws = null;
         this.setState({ connected: false, reconnecting: this.shouldRun });
+        void this.sendHttpHeartbeat(false);
         if (this.shouldRun) {
           this.reconnectTimer = setTimeout(() => {
             this.retryDelay = Math.min(8000, Math.round(this.retryDelay * 1.5));
@@ -190,7 +272,8 @@ class RealtimeClient {
       };
 
       ws.onerror = () => {
-        // Handled in onclose
+        // Fallback heartbeat handles discovery while WS retries
+        void this.sendHttpHeartbeat(false);
       };
     } catch {
       this.setState({ connected: false, reconnecting: this.shouldRun });
@@ -215,7 +298,19 @@ class RealtimeClient {
       return;
     }
     if (type === 'wifi:peers') {
-      this.setState({ wifiPeers: (msg.peers as PeerInfo[]) || [] });
+      this.setState({
+        wifiPeers: (msg.peers as PeerInfo[]) || [],
+        wifiLoading: false,
+        wifiError: null,
+      });
+      return;
+    }
+    if (type === 'peers:search_result') {
+      this.setState({
+        searchResults: (msg.peers as PeerInfo[]) || [],
+        searchingPeers: false,
+        searchError: null,
+      });
       return;
     }
     if (type === 'peer:status') {
@@ -303,45 +398,170 @@ class RealtimeClient {
     }
   }
 
-  public send(payload: unknown) {
+  public send(payload: unknown): boolean {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return false;
     this.ws.send(JSON.stringify(payload));
     return true;
   }
 
-  public discoverWifi() {
-    this.send({ type: 'discover_wifi' });
+  public async discoverWifi() {
+    this.setState({ wifiLoading: true, wifiError: null });
+    const sent = this.send({ type: 'discover_wifi' });
+    const base = this.resolveHttpBase(this.lastProfile?.lanServerUrl);
+    if (!base) {
+      if (!sent) {
+        this.setState({
+          wifiLoading: false,
+          wifiError: 'أدخل عنوان خادم الواي فاي المحلي (مثل 192.168.1.10:3000) للبحث على الشبكة.',
+        });
+      }
+      return;
+    }
+    try {
+      await this.sendHttpHeartbeat(false);
+      const self = encodeURIComponent(this.lastProfile?.privateCode || '');
+      const res = await fetch(`${base}/api/peers/wifi?self=${self}`);
+      if (res.ok) {
+        const data = (await res.json()) as { peers?: PeerInfo[] };
+        this.setState({
+          wifiPeers: data.peers || [],
+          wifiLoading: false,
+          wifiError: null,
+        });
+        return;
+      }
+    } catch {
+      if (!sent) {
+        this.setState({
+          wifiLoading: false,
+          wifiError: 'تعذر الوصول لخادم الشبكة المحلية الآن. تأكد من الاتصال بالواي فاي أو أعد المحاولة.',
+        });
+      }
+    }
   }
 
-  public lookupPeer(targetCode: string) {
+  public async searchPeers(query: string, scope: 'wifi' | 'online' | 'all' = 'all') {
+    this.setState({ searchingPeers: true, searchError: null });
+    this.send({ type: 'search_peers', query, scope });
+    const base = this.resolveHttpBase(this.lastProfile?.lanServerUrl);
+    if (!base) {
+      this.setState({
+        searchingPeers: false,
+        searchError: 'تعذر الاتصال بالخادم للبحث.',
+      });
+      return;
+    }
+    try {
+      await this.sendHttpHeartbeat(false);
+      const params = new URLSearchParams({
+        q: query.trim(),
+        scope,
+        self: this.lastProfile?.privateCode || '',
+      });
+      const res = await fetch(`${base}/api/peers/search?${params.toString()}`);
+      if (!res.ok) throw new Error('search failed');
+      const data = (await res.json()) as { peers?: PeerInfo[] };
+      this.setState({
+        searchResults: data.peers || [],
+        searchingPeers: false,
+        searchError: null,
+      });
+    } catch {
+      this.setState({
+        searchingPeers: false,
+        searchError: 'تعذر إتمام البحث عن الأصدقاء الآن. تحقق من الاتصال.',
+      });
+    }
+  }
+
+  public async lookupPeer(targetCode: string): Promise<PeerInfo | null> {
+    const clean = targetCode.trim();
     this.setState({ lookupError: null, lookedUpPeer: null });
-    this.send({ type: 'lookup_peer', targetCode });
+    this.send({ type: 'lookup_peer', targetCode: clean });
+    const base = this.resolveHttpBase(this.lastProfile?.lanServerUrl);
+    if (!base) return null;
+    try {
+      const self = encodeURIComponent(this.lastProfile?.privateCode || '');
+      const res = await fetch(`${base}/api/peers/lookup/${encodeURIComponent(clean)}?self=${self}`);
+      const data = (await res.json()) as { peer?: PeerInfo; error?: string };
+      if (!res.ok || data.error) {
+        this.setState({ lookupError: data.error || 'تعذر التحقق من الرقم', lookedUpPeer: null });
+        return null;
+      }
+      if (data.peer) {
+        this.setState({ lookedUpPeer: data.peer, lookupError: null });
+        return data.peer;
+      }
+    } catch {
+      // Ignore if offline
+    }
+    return null;
   }
 
-  public sendChallenge(toCode: string, mode: ConnectionMode, useTimer: boolean) {
+  public async sendChallenge(toCode: string, mode: ConnectionMode, useTimer: boolean) {
     this.setState({ challengeNotice: null });
-    this.send({
+    const sent = this.send({
       type: 'challenge:send',
       toCode,
       mode,
       useTimer,
       timerSeconds: 15,
     });
+    if (sent) return;
+
+    const base = this.resolveHttpBase(this.lastProfile?.lanServerUrl);
+    if (!base || !this.lastProfile) {
+      this.setState({ challengeNotice: 'غير متصل بالخادم حالياً — تأكد من الشبكة وأعد المحاولة.' });
+      return;
+    }
+    try {
+      await this.sendHttpHeartbeat(false);
+      const res = await fetch(`${base}/api/challenges/send`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          fromCode: this.lastProfile.privateCode,
+          toCode,
+          mode,
+          useTimer,
+          timerSeconds: 15,
+        }),
+      });
+      const data = (await res.json()) as { invite?: ChallengeInvite; error?: string };
+      if (!res.ok || data.error) {
+        this.setState({ challengeNotice: data.error || 'تعذر إرسال طلب التحدي.' });
+        return;
+      }
+      if (data.invite) {
+        this.setState({ outgoingInvite: data.invite, challengeNotice: null });
+      }
+    } catch {
+      this.setState({ challengeNotice: 'تعذر إرسال التحدي — تأكد من الاتصال بالخادم.' });
+    }
   }
 
   public respondToChallenge(inviteId: string, accept: boolean) {
     this.setState({ incomingInvite: null });
-    this.send({ type: 'challenge:respond', inviteId, accept });
+    const sent = this.send({ type: 'challenge:respond', inviteId, accept });
+    if (!sent) {
+      this.setState({ challengeNotice: 'انتظر إعادة الاتصال بالخادم لإتمام التحدي.' });
+    }
   }
 
   public createTeam(teamName: string, format: TeamFormat, mode: ConnectionMode, useTimer: boolean) {
     this.setState({ teamNotice: null, messages: [] });
-    this.send({ type: 'team:create', teamName, format, mode, useTimer });
+    const sent = this.send({ type: 'team:create', teamName, format, mode, useTimer });
+    if (!sent) {
+      this.setState({ teamNotice: 'جاري الاتصال بالخادم الفوري، حاول بعد لحظة.' });
+    }
   }
 
   public requestJoinTeam(codeOrLeader: string, side: 'A' | 'B' = 'A') {
     this.setState({ teamNotice: null });
-    this.send({ type: 'team:join_request', codeOrLeader, side });
+    const sent = this.send({ type: 'team:join_request', codeOrLeader, side });
+    if (!sent) {
+      this.setState({ teamNotice: 'تعذر إرسال طلب الانضمام — تأكد من الاتصال بالخادم.' });
+    }
   }
 
   public approveJoinRequest(requestId: string, approve: boolean, side?: 'A' | 'B') {
@@ -382,7 +602,13 @@ class RealtimeClient {
   }
 
   public clearNotices() {
-    this.setState({ challengeNotice: null, teamNotice: null, lookupError: null });
+    this.setState({
+      challengeNotice: null,
+      teamNotice: null,
+      lookupError: null,
+      wifiError: null,
+      searchError: null,
+    });
   }
 }
 

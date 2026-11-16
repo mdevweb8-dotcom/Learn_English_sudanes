@@ -1,5 +1,5 @@
 import { CEFR_LEVELS } from '../data/curriculum';
-import type { AppState, CEFRLevel, CEFRLevelId, FriendComparison, SkillTag } from '../types';
+import type { AppState, CEFRLevel, CEFRLevelId, FriendComparison, PeerInfo, SkillTag } from '../types';
 
 export const STORAGE_KEY = 'ffh_state_v1';
 const DB_NAME = 'ffh_offline_db';
@@ -231,13 +231,17 @@ export function getCurrentStudentLevel(state: AppState): CEFRLevelId {
 }
 
 export function generateFriendInviteCode(state: AppState): string {
+  const completedCount = Object.values(state.completedLessons).filter((v) => v >= 70).length;
   const payload = {
     v: 1,
+    p: state.profile.privateCode,
+    av: state.profile.avatarId,
     n: state.profile.name,
     l: getCurrentStudentLevel(state),
+    u: state.unlockedLevels,
     x: state.xp,
     s: state.streak,
-    c: Object.keys(state.completedLessons).length,
+    c: completedCount,
     a: getAverageSkillAccuracy(state),
   };
   const json = JSON.stringify(payload);
@@ -252,7 +256,7 @@ export function generateFriendInviteCode(state: AppState): string {
 export function parseFriendInviteCode(codeInput: string): FriendComparison {
   const trimmed = codeInput.trim();
   if (!trimmed.startsWith('FFH-')) {
-    throw new Error('كود الدعوة يجب أن يبدأ بـ FFH-');
+    throw new Error('كود الدعوة يجب أن يبدأ بـ FFH- أو أدخل رقم الصديق المكون من 6 أرقام');
   }
   const b64 = trimmed.slice(4);
   const bin = atob(b64);
@@ -261,8 +265,11 @@ export function parseFriendInviteCode(codeInput: string): FriendComparison {
   const json = new TextDecoder().decode(bytes);
   const parsed = JSON.parse(json) as {
     v?: number;
+    p?: string;
+    av?: string;
     n?: string;
     l?: CEFRLevelId;
+    u?: CEFRLevelId[];
     x?: number;
     s?: number;
     c?: number;
@@ -273,12 +280,34 @@ export function parseFriendInviteCode(codeInput: string): FriendComparison {
   }
   return {
     code: trimmed,
+    privateCode: parsed.p && /^\d{6}$/.test(parsed.p) ? parsed.p : undefined,
+    avatarId: parsed.av,
     name: parsed.n.slice(0, 32),
     level: parsed.l || 'A1',
+    unlockedLevels: Array.isArray(parsed.u) && parsed.u.length > 0 ? parsed.u : [parsed.l || 'A1'],
     xp: Math.max(0, Math.round(parsed.x)),
     streak: Math.max(0, Math.round(parsed.s || 0)),
     completedLessons: Math.max(0, Math.round(parsed.c || 0)),
     avgSkill: Math.max(0, Math.min(100, Math.round(parsed.a || 0))),
+    importedAt: new Date().toISOString(),
+  };
+}
+
+export function peerToFriendComparison(peer: PeerInfo): FriendComparison {
+  return {
+    code: `CODE-${peer.privateCode}`,
+    privateCode: peer.privateCode,
+    avatarId: peer.avatarId,
+    name: peer.name,
+    level: peer.levelId || 'A1',
+    unlockedLevels:
+      Array.isArray(peer.unlockedLevels) && peer.unlockedLevels.length > 0
+        ? peer.unlockedLevels
+        : [peer.levelId || 'A1'],
+    xp: Math.max(0, Math.round(peer.xp ?? 0)),
+    streak: Math.max(0, Math.round(peer.streak ?? 0)),
+    completedLessons: Math.max(0, Math.round(peer.completedLessons ?? 0)),
+    avgSkill: Math.max(0, Math.min(100, Math.round(peer.avgSkill ?? 75))),
     importedAt: new Date().toISOString(),
   };
 }

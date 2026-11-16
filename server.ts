@@ -10,7 +10,13 @@ import { createServer as createViteServer } from 'vite';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const PORT = Number(process.env.PORT || 3000);
+const portArgIdx = process.argv.indexOf('--port');
+const cliPort = portArgIdx >= 0 ? Number(process.argv[portArgIdx + 1]) : NaN;
+const envPort =
+  process.env.PORT && process.env.PORT !== process.env.NGINX_PORT
+    ? Number(process.env.PORT)
+    : 3000;
+const PORT = Number.isFinite(cliPort) && cliPort > 0 ? cliPort : envPort;
 
 const ai = process.env.GEMINI_API_KEY
   ? new GoogleGenAI({
@@ -351,24 +357,35 @@ function normalizeIp(req: http.IncomingMessage): string {
   if (raw === '::1' || raw === '127.0.0.1' || raw === '::ffff:127.0.0.1') {
     return 'local-wifi-lan';
   }
-  // Group devices on the same IPv4 /24 local Wi-Fi subnet or same NAT public IP
   const clean = raw.replace(/^::ffff:/, '');
+  // Group IPv4 devices on same /24 LAN subnet
   if (/^(192\.168\.|10\.|172\.(1[6-9]|2\d|3[0-1])\.)/.test(clean)) {
     const parts = clean.split('.');
     return `lan-${parts[0]}.${parts[1]}.${parts[2]}`;
+  }
+  // Group IPv6 devices on same /48 home/router prefix
+  if (clean.includes(':')) {
+    const segs = clean.split(':').slice(0, 3).join(':');
+    return `v6-${segs}`;
   }
   return clean;
 }
 
 interface ClientRecord {
-  ws: WebSocket;
+  ws: WebSocket | null;
   privateCode: string;
   name: string;
   avatarId: string;
   levelId: string;
+  xp: number;
+  streak: number;
+  completedLessons: number;
+  avgSkill: number;
+  unlockedLevels: string[];
   status: 'online' | 'in_game';
   networkKey: string;
   roomId: string | null;
+  lastSeen: number;
 }
 
 interface PendingInvite {
@@ -440,30 +457,58 @@ const codeBySocket = new Map<WebSocket, string>();
 const invitesById = new Map<string, PendingInvite>();
 const roomsById = new Map<string, RoomState>();
 const roomMessages = new Map<string, RoomChatMessage[]>();
+const pendingHttpEvents = new Map<string, unknown[]>();
 
-function sendToSocket(ws: WebSocket | undefined, payload: unknown) {
+// Expire HTTP-only heartbeat clients that haven't pinged for > 2 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [code, rec] of clientsByCode.entries()) {
+    if (!rec.ws && now - rec.lastSeen > 120_000) {
+      if (rec.roomId) removeMemberFromRoom(code);
+      clientsByCode.delete(code);
+      pendingHttpEvents.delete(code);
+    }
+  }
+}, 45_000);
+
+function serializePeer(p: ClientRecord, viewerNetworkKey?: string) {
+  return {
+    privateCode: p.privateCode,
+    name: p.name,
+    avatarId: p.avatarId,
+    levelId: p.levelId,
+    status: p.status,
+    sameWifi: viewerNetworkKey ? p.networkKey === viewerNetworkKey : false,
+    xp: p.xp,
+    streak: p.streak,
+    completedLessons: p.completedLessons,
+    avgSkill: p.avgSkill,
+    unlockedLevels: p.unlockedLevels,
+  };
+}
+
+function sendToSocket(ws: WebSocket | null | undefined, payload: unknown) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   ws.send(JSON.stringify(payload));
 }
 
 function sendToCode(code: string, payload: unknown) {
   const client = clientsByCode.get(code);
-  if (client) sendToSocket(client.ws, payload);
+  if (client?.ws && client.ws.readyState === WebSocket.OPEN) {
+    sendToSocket(client.ws, payload);
+  } else if (client) {
+    const q = pendingHttpEvents.get(code) || [];
+    pendingHttpEvents.set(code, [...q.slice(-24), payload]);
+  }
 }
 
 function broadcastWifiPeersForNetwork(networkKey: string) {
   const netClients = Array.from(clientsByCode.values()).filter((c) => c.networkKey === networkKey);
   for (const viewer of netClients) {
+    if (!viewer.ws || viewer.ws.readyState !== WebSocket.OPEN) continue;
     const peers = netClients
       .filter((p) => p.privateCode !== viewer.privateCode)
-      .map((p) => ({
-        privateCode: p.privateCode,
-        name: p.name,
-        avatarId: p.avatarId,
-        levelId: p.levelId,
-        status: p.status,
-        sameWifi: true,
-      }));
+      .map((p) => serializePeer(p, viewer.networkKey));
     sendToSocket(viewer.ws, { type: 'wifi:peers', peers });
   }
 }
@@ -613,6 +658,187 @@ ${toneGuide}
     }
   });
 
+  // Allow CORS for local Wi-Fi / Capacitor clients connecting to LAN IP
+  app.use('/api', (req, res, next) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    if (req.method === 'OPTIONS') {
+      res.status(204).end();
+      return;
+    }
+    next();
+  });
+
+  app.get('/api/health', (_req, res) => {
+    res.json({ ok: true, peers: clientsByCode.size, rooms: roomsById.size });
+  });
+
+  // HTTP fallback registration & polling for environments where WebSocket is blocked or slow
+  app.post('/api/peers/heartbeat', (req, res) => {
+    const networkKey = normalizeIp(req);
+    const privateCode = String(req.body?.privateCode || '').trim();
+    if (!/^\d{6}$/.test(privateCode)) {
+      res.status(400).json({ error: 'الرقم الخاص يجب أن يتكون من 6 أرقام.' });
+      return;
+    }
+    const existing = clientsByCode.get(privateCode);
+    if (existing && existing.ws && existing.ws.readyState === WebSocket.OPEN && existing.networkKey === networkKey && req.body?.httpOnly) {
+      res.status(409).json({
+        code: 'CODE_CONFLICT',
+        error: 'يوجد جهاز آخر على نفس شبكة الواي فاي يستخدم هذا الرقم الخاص! يرجى تغييره.',
+      });
+      return;
+    }
+
+    const updated: ClientRecord = {
+      ws: existing?.ws || null,
+      privateCode,
+      name: String(req.body?.name || existing?.name || 'متعلم').trim().slice(0, 32),
+      avatarId: String(req.body?.avatarId || existing?.avatarId || 'avatar-scholar'),
+      levelId: String(req.body?.levelId || existing?.levelId || 'A1'),
+      xp: Number(req.body?.xp ?? existing?.xp ?? 0),
+      streak: Number(req.body?.streak ?? existing?.streak ?? 0),
+      completedLessons: Number(req.body?.completedLessons ?? existing?.completedLessons ?? 0),
+      avgSkill: Number(req.body?.avgSkill ?? existing?.avgSkill ?? 75),
+      unlockedLevels: Array.isArray(req.body?.unlockedLevels)
+        ? req.body.unlockedLevels.map(String)
+        : existing?.unlockedLevels || ['A1'],
+      status: existing?.roomId ? 'in_game' : 'online',
+      networkKey: existing?.ws ? existing.networkKey : networkKey,
+      roomId: existing?.roomId || null,
+      lastSeen: Date.now(),
+    };
+    clientsByCode.set(privateCode, updated);
+
+    const events = pendingHttpEvents.get(privateCode) || [];
+    pendingHttpEvents.set(privateCode, []);
+    res.json({ ok: true, privateCode, networkKey: updated.networkKey, events });
+  });
+
+  app.get('/api/peers/wifi', (req, res) => {
+    const networkKey = normalizeIp(req);
+    const self = String(req.query.self || '').trim();
+    const peers = Array.from(clientsByCode.values())
+      .filter((p) => p.networkKey === networkKey && p.privateCode !== self)
+      .map((p) => serializePeer(p, networkKey));
+    res.json({ peers, networkKey });
+  });
+
+  app.get('/api/peers/search', (req, res) => {
+    const networkKey = normalizeIp(req);
+    const self = String(req.query.self || '').trim();
+    const q = String(req.query.q || '').trim().toLowerCase();
+    const scope = String(req.query.scope || 'all');
+
+    const peers = Array.from(clientsByCode.values())
+      .filter((p) => {
+        if (p.privateCode === self) return false;
+        if (scope === 'wifi' && p.networkKey !== networkKey) return false;
+        if (!q) return true;
+        return (
+          p.privateCode.includes(q) ||
+          p.name.toLowerCase().includes(q) ||
+          p.levelId.toLowerCase() === q
+        );
+      })
+      .slice(0, 30)
+      .map((p) => serializePeer(p, networkKey));
+
+    res.json({ peers });
+  });
+
+  app.get('/api/peers/lookup/:code', (req, res) => {
+    const networkKey = normalizeIp(req);
+    const targetCode = String(req.params.code || '').trim();
+    const self = String(req.query.self || '').trim();
+    if (!/^\d{6}$/.test(targetCode) || (self && targetCode === self)) {
+      res.status(400).json({ error: 'أدخل رقماً صحيحاً من 6 أرقام غير رقمك الخاص.' });
+      return;
+    }
+    const target = clientsByCode.get(targetCode);
+    res.json({
+      peer: target
+        ? serializePeer(target, networkKey)
+        : {
+            privateCode: targetCode,
+            name: 'صديق غير متصل',
+            avatarId: 'avatar-scholar',
+            levelId: 'A1',
+            status: 'offline',
+          },
+    });
+  });
+
+  app.post('/api/challenges/send', (req, res) => {
+    const fromCode = String(req.body?.fromCode || '').trim();
+    const toCode = String(req.body?.toCode || '').trim();
+    const mode = req.body?.mode === 'wifi' ? 'wifi' : 'online';
+    const useTimer = Boolean(req.body?.useTimer);
+    const timerSeconds = Number(req.body?.timerSeconds || 15);
+
+    const sender = clientsByCode.get(fromCode);
+    const target = clientsByCode.get(toCode);
+    if (!sender) {
+      res.status(400).json({ error: 'يرجى الانتظار لحظة حتى يكتمل تسجيل حسابك على الخادم.' });
+      return;
+    }
+    if (!/^\d{6}$/.test(toCode) || toCode === fromCode) {
+      res.status(400).json({ error: 'الرقم الخاص غير صالح أو يطابق رقمك.' });
+      return;
+    }
+    if (!target) {
+      res.status(404).json({ error: 'الصديق غير متصل حالياً.' });
+      return;
+    }
+
+    const inviteId = `INV-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+    const createdAt = Date.now();
+    const expiresAt = createdAt + 30_000;
+    const timeoutHandle = setTimeout(() => {
+      const pending = invitesById.get(inviteId);
+      if (!pending) return;
+      invitesById.delete(inviteId);
+      sendToCode(pending.fromCode, { type: 'challenge:expired', inviteId, message: 'لم يتم الرد' });
+      sendToCode(pending.toCode, {
+        type: 'challenge:expired',
+        inviteId,
+        message: 'انتهت مهلة طلب التحدي (30 ثانية)',
+      });
+    }, 30_000);
+
+    const invite: PendingInvite = {
+      inviteId,
+      fromCode: sender.privateCode,
+      fromName: sender.name,
+      fromAvatar: sender.avatarId,
+      toCode: target.privateCode,
+      mode,
+      useTimer,
+      timerSeconds,
+      levelId: sender.levelId,
+      createdAt,
+      expiresAt,
+      timeoutHandle,
+    };
+    invitesById.set(inviteId, invite);
+    const safeInvite = {
+      inviteId: invite.inviteId,
+      fromCode: invite.fromCode,
+      fromName: invite.fromName,
+      fromAvatar: invite.fromAvatar,
+      toCode: invite.toCode,
+      mode: invite.mode,
+      useTimer: invite.useTimer,
+      timerSeconds: invite.timerSeconds,
+      levelId: invite.levelId,
+      createdAt: invite.createdAt,
+      expiresAt: invite.expiresAt,
+    };
+    sendToCode(target.privateCode, { type: 'challenge:incoming', invite: safeInvite });
+    res.json({ ok: true, invite: safeInvite });
+  });
+
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -648,6 +874,13 @@ ${toneGuide}
         const name = String(msg.name || 'متعلم').trim().slice(0, 32);
         const avatarId = String(msg.avatarId || 'avatar-scholar');
         const levelId = String(msg.levelId || 'A1');
+        const xp = Number(msg.xp ?? 0);
+        const streak = Number(msg.streak ?? 0);
+        const completedLessons = Number(msg.completedLessons ?? 0);
+        const avgSkill = Number(msg.avgSkill ?? 75);
+        const unlockedLevels = Array.isArray(msg.unlockedLevels)
+          ? msg.unlockedLevels.map(String)
+          : [levelId];
 
         if (!/^\d{6}$/.test(privateCode)) {
           sendToSocket(ws, {
@@ -659,7 +892,7 @@ ${toneGuide}
         }
 
         const existing = clientsByCode.get(privateCode);
-        if (existing && existing.ws !== ws && existing.ws.readyState === WebSocket.OPEN) {
+        if (existing && existing.ws && existing.ws !== ws && existing.ws.readyState === WebSocket.OPEN) {
           // Strict rule: two devices on the same network cannot hold identical 6-digit codes
           if (existing.networkKey === networkKey) {
             sendToSocket(ws, {
@@ -688,9 +921,15 @@ ${toneGuide}
           name,
           avatarId,
           levelId,
+          xp: Number.isFinite(xp) ? xp : 0,
+          streak: Number.isFinite(streak) ? streak : 0,
+          completedLessons: Number.isFinite(completedLessons) ? completedLessons : 0,
+          avgSkill: Number.isFinite(avgSkill) ? avgSkill : 75,
+          unlockedLevels,
           status: existing?.roomId ? 'in_game' : 'online',
           networkKey,
           roomId: existing?.roomId || null,
+          lastSeen: Date.now(),
         };
         clientsByCode.set(privateCode, record);
         codeBySocket.set(ws, privateCode);
@@ -714,19 +953,33 @@ ${toneGuide}
       if (!senderCode) return;
       const sender = clientsByCode.get(senderCode);
       if (!sender) return;
+      sender.lastSeen = Date.now();
 
       if (type === 'discover_wifi') {
         const peers = Array.from(clientsByCode.values())
           .filter((p) => p.networkKey === sender.networkKey && p.privateCode !== senderCode)
-          .map((p) => ({
-            privateCode: p.privateCode,
-            name: p.name,
-            avatarId: p.avatarId,
-            levelId: p.levelId,
-            status: p.status,
-            sameWifi: true,
-          }));
+          .map((p) => serializePeer(p, sender.networkKey));
         sendToSocket(ws, { type: 'wifi:peers', peers });
+        return;
+      }
+
+      if (type === 'search_peers') {
+        const q = String(msg.query || '').trim().toLowerCase();
+        const scope = String(msg.scope || 'all');
+        const peers = Array.from(clientsByCode.values())
+          .filter((p) => {
+            if (p.privateCode === senderCode) return false;
+            if (scope === 'wifi' && p.networkKey !== sender.networkKey) return false;
+            if (!q) return true;
+            return (
+              p.privateCode.includes(q) ||
+              p.name.toLowerCase().includes(q) ||
+              p.levelId.toLowerCase() === q
+            );
+          })
+          .slice(0, 30)
+          .map((p) => serializePeer(p, sender.networkKey));
+        sendToSocket(ws, { type: 'peers:search_result', peers, query: q, scope });
         return;
       }
 
@@ -743,14 +996,7 @@ ${toneGuide}
         sendToSocket(ws, {
           type: 'peer:status',
           peer: target
-            ? {
-                privateCode: target.privateCode,
-                name: target.name,
-                avatarId: target.avatarId,
-                levelId: target.levelId,
-                status: target.status,
-                sameWifi: target.networkKey === sender.networkKey,
-              }
+            ? serializePeer(target, sender.networkKey)
             : {
                 privateCode: targetCode,
                 name: 'صديق غير متصل',
@@ -776,13 +1022,6 @@ ${toneGuide}
         const target = clientsByCode.get(toCode);
         if (!target) {
           sendToSocket(ws, { type: 'challenge:error', message: 'الصديق غير متصل حالياً.' });
-          return;
-        }
-        if (mode === 'wifi' && target.networkKey !== sender.networkKey) {
-          sendToSocket(ws, {
-            type: 'challenge:error',
-            message: 'هذا الصديق ليس على نفس شبكة الواي فاي. جرّب التحدي أونلاين بالرقم الخاص.',
-          });
           return;
         }
 

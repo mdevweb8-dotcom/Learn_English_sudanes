@@ -6,6 +6,7 @@ import {
   Mic,
   MicOff,
   Radio,
+  RefreshCw,
   Send,
   Settings,
   Smile,
@@ -16,7 +17,12 @@ import {
 } from 'lucide-react';
 import type { ChatChannel, ChatMessage, TeamMember, TeamRoomState } from '../types';
 import { realtimeClient } from '../services/realtime';
-import { openDeviceAppPermissions, playMessageDing } from '../utils/speech';
+import {
+  ensureMicrophoneStream,
+  openDeviceAppPermissions,
+  playMessageDing,
+  subscribeMicPermissionChanges,
+} from '../utils/speech';
 import { AvatarView } from './AvatarView';
 
 interface RoomChatAndVoiceProps {
@@ -65,6 +71,7 @@ export const RoomChatAndVoice: React.FC<RoomChatAndVoiceProps> = ({
   const [muteMenuTarget, setMuteMenuTarget] = useState<TeamMember | null>(null);
   const [micPermissionDenied, setMicPermissionDenied] = useState(false);
   const [voiceError, setVoiceError] = useState<string | null>(null);
+  const [checkingMic, setCheckingMic] = useState(false);
   const [postGameSecondsLeft, setPostGameSecondsLeft] = useState<number | null>(null);
 
   const localStreamRef = useRef<MediaStream | null>(null);
@@ -73,8 +80,17 @@ export const RoomChatAndVoice: React.FC<RoomChatAndVoiceProps> = ({
   const audioCtxRef = useRef<AudioContext | null>(null);
   const vadTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const longPressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const holdingPttRef = useRef<boolean>(false);
   const lastMsgCountRef = useRef<number>(messages.length);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
+
+  // Automatically clear permission warning as soon as browser or Android Settings grant microphone
+  useEffect(() => {
+    return subscribeMicPermissionChanges(() => {
+      setMicPermissionDenied(false);
+      setVoiceError(null);
+    });
+  }, []);
 
   const myMember = room.members.find((m) => m.privateCode === myCode);
   const isLeader = room.leaderCode === myCode;
@@ -269,30 +285,35 @@ export const RoomChatAndVoice: React.FC<RoomChatAndVoiceProps> = ({
   const ensureMicrophoneAndConnect = async (): Promise<boolean> => {
     if (!voiceChatEnabled || chatExpired) return false;
     if (localStreamRef.current) {
+      setMicPermissionDenied(false);
+      setVoiceError(null);
       localStreamRef.current.getAudioTracks().forEach((t) => {
         t.enabled = !selfMuted;
       });
       return true;
     }
 
-    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-      setVoiceError('المتصفح الحالي لا يدعم الميكروفون المباشر (WebRTC).');
+    setCheckingMic(true);
+    setMicPermissionDenied(false);
+    setVoiceError(null);
+    const micRes = await ensureMicrophoneStream();
+    setCheckingMic(false);
+
+    if (!micRes.ok) {
+      if (micRes.reason === 'denied') {
+        setMicPermissionDenied(true);
+        setVoiceError(micRes.message);
+      } else {
+        setMicPermissionDenied(false);
+        setVoiceError(micRes.message);
+      }
       return false;
     }
 
-    try {
-      setMicPermissionDenied(false);
-      setVoiceError(null);
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        },
-        video: false,
-      });
-      localStreamRef.current = stream;
+    const stream = micRes.stream;
+    localStreamRef.current = stream;
 
+    try {
       // Setup local Voice Activity Detection for speaking indicator
       const AudioCtx =
         window.AudioContext ||
@@ -324,7 +345,11 @@ export const RoomChatAndVoice: React.FC<RoomChatAndVoiceProps> = ({
           }
         }, 220);
       }
+    } catch {
+      // VAD meter optional; audio transmission still works
+    }
 
+    try {
       // Connect to target peers
       const targets = otherMembers.filter((m) => talkToAll || !myMember || m.side === myMember.side);
       for (const peer of targets) {
@@ -342,23 +367,26 @@ export const RoomChatAndVoice: React.FC<RoomChatAndVoiceProps> = ({
           signal: { kind: 'offer', sdp: pc.localDescription },
         });
       }
-
-      return true;
-    } catch (err) {
-      const msg = err instanceof Error ? err.name : '';
-      if (msg === 'NotAllowedError' || msg === 'PermissionDeniedError') {
-        setMicPermissionDenied(true);
-      } else {
-        setVoiceError('تعذر تشغيل الميكروفون حالياً.');
-      }
-      return false;
+    } catch {
+      // WebRTC negotiation errors should never be labeled as microphone permission errors
+      setVoiceError('تم فتح الميكروفون، لكن حدث تأخير مؤقت في ربط الصوت مع الصديق.');
     }
+
+    return true;
   };
 
-  const startTalking = async () => {
+  const startTalking = async (fromPtt = false) => {
     if (!voiceChatEnabled || selfMuted || chatExpired) return;
     const ok = await ensureMicrophoneAndConnect();
     if (!ok) return;
+    // If user released PTT button while answering the browser permission dialog, prepare stream silently
+    if (fromPtt && !holdingPttRef.current) {
+      localStreamRef.current?.getAudioTracks().forEach((t) => {
+        t.enabled = false;
+      });
+      setMicActive(false);
+      return;
+    }
     localStreamRef.current?.getAudioTracks().forEach((t) => {
       t.enabled = true;
     });
@@ -367,6 +395,7 @@ export const RoomChatAndVoice: React.FC<RoomChatAndVoiceProps> = ({
   };
 
   const stopTalking = () => {
+    holdingPttRef.current = false;
     if (localStreamRef.current) {
       localStreamRef.current.getAudioTracks().forEach((t) => {
         t.enabled = false;
@@ -483,11 +512,12 @@ export const RoomChatAndVoice: React.FC<RoomChatAndVoiceProps> = ({
                   type="button"
                   onPointerDown={(e) => {
                     e.preventDefault();
-                    startTalking();
+                    holdingPttRef.current = true;
+                    void startTalking(true);
                   }}
                   onPointerUp={() => stopTalking()}
                   onPointerLeave={() => {
-                    if (micActive) stopTalking();
+                    if (holdingPttRef.current || micActive) stopTalking();
                   }}
                   onPointerCancel={() => stopTalking()}
                   className={`inline-flex min-h-[46px] select-none items-center gap-2 rounded-xl px-4 py-2.5 text-xs font-extrabold transition ${
@@ -596,13 +626,40 @@ export const RoomChatAndVoice: React.FC<RoomChatAndVoiceProps> = ({
         {micPermissionDenied && (
           <div className="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-200 bg-amber-50 p-3 text-xs text-amber-900">
             <span>يجب السماح بصلاحية الميكروفون للتحدث مع أصدقائك أثناء اللعب.</span>
-            <button
-              type="button"
-              onClick={openDeviceAppPermissions}
-              className="inline-flex min-h-[36px] items-center gap-1 rounded-lg bg-amber-600 px-3 py-1.5 font-bold text-white"
-            >
-              <Settings className="h-3.5 w-3.5" /> فتح الإعدادات
-            </button>
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                disabled={checkingMic}
+                onClick={async () => {
+                  const ok = await ensureMicrophoneAndConnect();
+                  if (ok && localStreamRef.current) {
+                    localStreamRef.current.getAudioTracks().forEach((t) => {
+                      t.enabled = false;
+                    });
+                    setMicPermissionDenied(false);
+                    setVoiceError(null);
+                  }
+                }}
+                className="inline-flex min-h-[36px] items-center gap-1 rounded-lg bg-emerald-600 px-3 py-1.5 font-bold text-white hover:bg-emerald-700 disabled:opacity-60"
+              >
+                <RefreshCw className={`h-3.5 w-3.5 ${checkingMic ? 'animate-spin' : ''}`} />
+                <span>أعد المحاولة الآن</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  const env = openDeviceAppPermissions();
+                  if (env === 'web') {
+                    setVoiceError(
+                      'اضغط على أيقونة القفل أو الإعدادات بجانب رابط الموقع في أعلى المتصفح وفعّل إذن الميكروفون ثم اضغط «أعد المحاولة الآن».',
+                    );
+                  }
+                }}
+                className="inline-flex min-h-[36px] items-center gap-1 rounded-lg bg-amber-600 px-3 py-1.5 font-bold text-white hover:bg-amber-700"
+              >
+                <Settings className="h-3.5 w-3.5" /> فتح الإعدادات
+              </button>
+            </div>
           </div>
         )}
 

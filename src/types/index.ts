@@ -125,8 +125,11 @@ export interface BadgeDef {
 
 export interface FriendComparison {
   code: string;
+  privateCode?: string;
+  avatarId?: string;
   name: string;
   level: CEFRLevelId;
+  unlockedLevels?: CEFRLevelId[];
   xp: number;
   streak: number;
   completedLessons: number;
@@ -145,6 +148,11 @@ export interface PeerInfo {
   levelId: CEFRLevelId;
   status: PresenceStatus;
   sameWifi?: boolean;
+  xp?: number;
+  streak?: number;
+  completedLessons?: number;
+  avgSkill?: number;
+  unlockedLevels?: CEFRLevelId[];
 }
 
 export interface ChallengeInvite {

@@ -1,57 +1,55 @@
-
 name: Build Android APK
 
 on:
-  workflow_dispatch:
   push:
-    branches:
-      - main
-
-permissions:
-  contents: read
+    branches: [main, master]
+  workflow_dispatch:
 
 jobs:
-  build:
+  build-apk:
+    name: Build Friendly Fluency Hub Debug APK
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Java 21
-        uses: actions/setup-java@v4
-        with:
-          distribution: zulu
-          java-version: 21
-
-      - name: Setup Node.js
+      - name: Setup Node.js 22
         uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: '22'
+
+      - name: Setup Java 21 (Zulu)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '21'
 
       - name: Install dependencies
         run: npm install --legacy-peer-deps
 
-      - name: Generate icons
-        run: npm run generate-icons
+      - name: Run tests if present
+        run: npm test || true
 
-      - name: Verify Android config
+      - name: Verify Android & Capacitor configuration
         run: npm run verify-android-config
 
-      - name: Build web app
+      - name: Build web app & PWA
         run: npm run build
 
-      - name: Sync Capacitor
+      - name: Sync Capacitor Android project
         run: npx cap sync android
 
-      - name: Build APK
-        run: |
-          chmod +x android/gradlew
-          cd android
-          ./gradlew assembleDebug
+      - name: Make Gradle wrapper executable
+        run: chmod +x android/gradlew
 
-      - name: Upload APK
+      - name: Build Debug APK
+        working-directory: android
+        run: ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Friendly-Fluency-Hub-APK
+          name: English-Fluency-Hub-APK
           path: android/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error

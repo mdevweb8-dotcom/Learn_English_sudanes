@@ -12,7 +12,9 @@ import {
   Play,
   RefreshCw,
   RotateCcw,
+  Search,
   Swords,
+  Table2,
   TimerOff,
   Trophy,
   UserCheck,
@@ -26,6 +28,7 @@ import type {
   AppState,
   ConnectionMode,
   MatchRecord,
+  PeerInfo,
   TeamFormat,
 } from '../types';
 import { realtimeClient, type RealtimeState } from '../services/realtime';
@@ -40,6 +43,9 @@ interface MultiplayerHubModalProps {
   onRegenerateCode: () => void;
   onUpdateLanUrl: (url: string) => void;
   onSaveMatchResult: (record: MatchRecord, xpReward: number, coinsReward: number) => void;
+  onAddFriendByAnyCode: (code: string) => Promise<{ ok: boolean; message: string }>;
+  onAddFriendFromPeer: (peer: PeerInfo) => { ok: boolean; message: string };
+  onOpenComparisonModal: () => void;
   onClose: () => void;
 }
 
@@ -50,11 +56,17 @@ export const MultiplayerHubModal: React.FC<MultiplayerHubModalProps> = ({
   onRegenerateCode,
   onUpdateLanUrl,
   onSaveMatchResult,
+  onAddFriendByAnyCode,
+  onAddFriendFromPeer,
+  onOpenComparisonModal,
   onClose,
 }) => {
   const [tab, setTab] = useState<'wifi' | 'online' | 'teams'>(initialTab);
   const [manualCode, setManualCode] = useState('');
   const [manualError, setManualError] = useState('');
+  const [friendFeedback, setFriendFeedback] = useState<{ ok: boolean; text: string } | null>(null);
+  const [wifiSearch, setWifiSearch] = useState('');
+  const [onlineSearch, setOnlineSearch] = useState('');
   const [useTimer, setUseTimer] = useState(true);
   const [copiedCode, setCopiedCode] = useState(false);
   const [lanInput, setLanInput] = useState(state.profile.lanServerUrl || '');
@@ -82,12 +94,20 @@ export const MultiplayerHubModal: React.FC<MultiplayerHubModalProps> = ({
   const myCode = state.profile.privateCode;
   const room = realtime.room;
 
-  // Auto-discover Wi-Fi peers whenever opening Wi-Fi tab
+  // Auto-discover Wi-Fi peers and refresh active search whenever opening lobby
   useEffect(() => {
-    if (realtime.connected && !room) {
-      realtimeClient.discoverWifi();
+    if (room) return;
+    if (tab === 'wifi') {
+      void realtimeClient.discoverWifi();
+      const pollId = setInterval(() => {
+        void realtimeClient.discoverWifi();
+      }, 4500);
+      return () => clearInterval(pollId);
     }
-  }, [tab, realtime.connected, room]);
+    if (tab === 'online') {
+      void realtimeClient.searchPeers(onlineSearch, 'online');
+    }
+  }, [tab, realtime.connected, realtime.registeredCode, room]);
 
   // Countdown for outgoing challenge (30s)
   useEffect(() => {
@@ -177,6 +197,22 @@ export const MultiplayerHubModal: React.FC<MultiplayerHubModalProps> = ({
     return [...currentQuestion.wordsToOrder].sort((a, b) => a.localeCompare(b));
   }, [currentQuestion?.id]);
 
+  const isFriendAdded = (privateCode: string) =>
+    state.friends.some((f) => f.privateCode === privateCode || f.code === `CODE-${privateCode}`);
+
+  const filteredWifiPeers = useMemo(() => {
+    const q = wifiSearch.trim().toLowerCase();
+    if (!q) return realtime.wifiPeers;
+    return realtime.wifiPeers.filter(
+      (p) => p.name.toLowerCase().includes(q) || p.privateCode.includes(q),
+    );
+  }, [realtime.wifiPeers, wifiSearch]);
+
+  const savedFriendsWithCode = useMemo(
+    () => state.friends.filter((f) => Boolean(f.privateCode)),
+    [state.friends],
+  );
+
   const handleManualChallenge = (mode: ConnectionMode) => {
     const clean = manualCode.trim();
     if (!/^\d{6}$/.test(clean)) {
@@ -189,9 +225,24 @@ export const MultiplayerHubModal: React.FC<MultiplayerHubModalProps> = ({
     }
     setManualError('');
     if (mode === 'online') {
-      realtimeClient.lookupPeer(clean);
+      void realtimeClient.lookupPeer(clean);
     }
-    realtimeClient.sendChallenge(clean, mode, useTimer);
+    void realtimeClient.sendChallenge(clean, mode, useTimer);
+  };
+
+  const handleManualAddFriend = async () => {
+    const clean = manualCode.trim();
+    if (!/^\d{6}$/.test(clean)) {
+      setManualError('أدخل رقم الصديق المكون من 6 أرقام لإضافته.');
+      return;
+    }
+    if (clean === myCode) {
+      setManualError('لا يمكنك إضافة رقمك الخاص كصديق.');
+      return;
+    }
+    setManualError('');
+    const res = await onAddFriendByAnyCode(clean);
+    setFriendFeedback({ ok: res.ok, text: res.message });
   };
 
   const handleConfirmQuizAnswer = () => {
@@ -847,61 +898,139 @@ export const MultiplayerHubModal: React.FC<MultiplayerHubModalProps> = ({
           </div>
         )}
 
-        {/* TAB 1: SAME WI-FI FRIENDS DISCOVERY + MANUAL FALLBACK */}
+        {/* TAB 1: SAME WI-FI FRIENDS DISCOVERY + SEARCH + ADD FRIEND + MANUAL FALLBACK */}
         {tab === 'wifi' && (
           <div className="space-y-4">
-            <div className="flex items-center justify-between">
+            <div className="flex flex-wrap items-center justify-between gap-2">
               <h3 className="text-sm font-extrabold text-slate-900">
-                الأجهزة المكتشفة على نفس شبكة الواي فاي ({realtime.wifiPeers.length})
+                الأجهزة المكتشفة على نفس شبكة الواي فاي ({filteredWifiPeers.length})
               </h3>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    onClose();
+                    onOpenComparisonModal();
+                  }}
+                  className="inline-flex min-h-[38px] items-center gap-1.5 rounded-xl border border-slate-200 bg-slate-50 px-3 py-1.5 text-xs font-bold text-slate-800 hover:bg-slate-100"
+                >
+                  <Table2 className="h-3.5 w-3.5 text-[var(--accent-primary)]" /> جدول المقارنة
+                </button>
+                <button
+                  type="button"
+                  disabled={realtime.wifiLoading}
+                  onClick={() => void realtimeClient.discoverWifi()}
+                  className="inline-flex min-h-[38px] items-center gap-1.5 rounded-xl border border-slate-200 px-3 py-1.5 text-xs font-bold text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+                >
+                  <RefreshCw className={`h-3.5 w-3.5 ${realtime.wifiLoading ? 'animate-spin' : ''}`} />{' '}
+                  {realtime.wifiLoading ? 'جاري البحث...' : 'تحديث البحث'}
+                </button>
+              </div>
+            </div>
+
+            {/* Wi-Fi Search Input */}
+            <div className="flex gap-2">
+              <div className="relative flex-1">
+                <Search className="pointer-events-none absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+                <input
+                  type="search"
+                  value={wifiSearch}
+                  onChange={(e) => setWifiSearch(e.target.value)}
+                  placeholder="ابحث عن صديق على الواي فاي بالاسم أو الرقم الخاص..."
+                  className="min-h-[42px] w-full rounded-xl border border-slate-200 bg-white pl-3 pr-9 text-xs font-semibold text-slate-900 outline-none focus:border-[var(--accent-primary)]"
+                />
+              </div>
               <button
                 type="button"
-                onClick={() => realtimeClient.discoverWifi()}
-                className="inline-flex min-h-[38px] items-center gap-1.5 rounded-xl border border-slate-200 px-3 py-1.5 text-xs font-bold text-slate-700 hover:bg-slate-50"
+                onClick={() => void realtimeClient.searchPeers(wifiSearch, 'all')}
+                className="min-h-[42px] rounded-xl border border-slate-300 bg-slate-50 px-3.5 text-xs font-bold text-slate-800 hover:bg-slate-100"
               >
-                <RefreshCw className="h-3.5 w-3.5" /> تحديث البحث
+                بحث شامل
               </button>
             </div>
 
-            {realtime.wifiPeers.length === 0 ? (
-              <div className="rounded-xl border border-dashed border-slate-300 bg-slate-50 p-5 text-center text-xs text-slate-500">
-                لم يُكتشف أصدقاء على نفس الواي فاي بعد — اطلب من صديقك فتح التطبيق، أو أدخل رقمه الخاص أدناه!
-              </div>
-            ) : (
-              <div className="space-y-2">
-                {realtime.wifiPeers.map((peer) => (
-                  <div
-                    key={peer.privateCode}
-                    className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-slate-200 bg-white px-4 py-3"
-                  >
-                    <div className="flex items-center gap-3">
-                      <AvatarView avatarId={peer.avatarId} size={40} />
-                      <div>
-                        <p className="text-sm font-extrabold text-slate-900">{peer.name}</p>
-                        <p className="text-xs text-slate-500">
-                          الرقم: <span className="font-mono font-bold">{peer.privateCode}</span> ·{' '}
-                          <span className={peer.status === 'online' ? 'text-emerald-700' : 'text-amber-700'}>
-                            {peer.status === 'online' ? 'متصل' : 'في لعبة'}
-                          </span>
-                        </p>
-                      </div>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => realtimeClient.sendChallenge(peer.privateCode, 'wifi', useTimer)}
-                      className="inline-flex min-h-[40px] items-center gap-1.5 rounded-xl bg-[var(--accent-primary)] px-4 py-2 text-xs font-bold text-white"
-                    >
-                      <Swords className="h-4 w-4" /> تحدي
-                    </button>
-                  </div>
-                ))}
+            {realtime.wifiError && (
+              <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-2.5 text-xs font-bold text-amber-900">
+                {realtime.wifiError}
               </div>
             )}
 
-            {/* Manual 6-digit fallback */}
+            {friendFeedback && (
+              <div
+                className={`rounded-xl border px-4 py-2.5 text-xs font-bold ${
+                  friendFeedback.ok
+                    ? 'border-emerald-200 bg-emerald-50 text-emerald-900'
+                    : 'border-rose-200 bg-rose-50 text-rose-900'
+                }`}
+              >
+                {friendFeedback.text}
+              </div>
+            )}
+
+            {filteredWifiPeers.length === 0 ? (
+              <div className="rounded-xl border border-dashed border-slate-300 bg-slate-50 p-5 text-center text-xs text-slate-500">
+                {wifiSearch.trim()
+                  ? 'لا توجد نتائج مطابقة على نفس الشبكة — جرب البحث الشامل أو أدخل الرقم الخاص أدناه.'
+                  : 'لم يُكتشف أصدقاء على نفس الواي فاي بعد — اطلب من صديقك فتح التطبيق، أو أدخل رقمه الخاص أدناه!'}
+              </div>
+            ) : (
+              <div className="space-y-2">
+                {filteredWifiPeers.map((peer) => {
+                  const added = isFriendAdded(peer.privateCode);
+                  return (
+                    <div
+                      key={peer.privateCode}
+                      className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-slate-200 bg-white px-4 py-3"
+                    >
+                      <div className="flex items-center gap-3">
+                        <AvatarView avatarId={peer.avatarId} size={40} />
+                        <div>
+                          <p className="text-sm font-extrabold text-slate-900">{peer.name}</p>
+                          <p className="text-xs text-slate-500">
+                            الرقم: <span className="font-mono font-bold">{peer.privateCode}</span> · المستوى{' '}
+                            {peer.levelId} ·{' '}
+                            <span className={peer.status === 'online' ? 'text-emerald-700' : 'text-amber-700'}>
+                              {peer.status === 'online' ? 'متصل' : 'في لعبة'}
+                            </span>
+                          </p>
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const res = onAddFriendFromPeer(peer);
+                            setFriendFeedback({ ok: res.ok, text: res.message });
+                          }}
+                          className={`inline-flex min-h-[40px] items-center gap-1.5 rounded-xl border px-3 py-2 text-xs font-bold ${
+                            added
+                              ? 'border-emerald-200 bg-emerald-50 text-emerald-800'
+                              : 'border-slate-200 bg-slate-50 text-slate-800 hover:bg-slate-100'
+                          }`}
+                        >
+                          {added ? <Check className="h-3.5 w-3.5" /> : <UserPlus className="h-3.5 w-3.5" />}
+                          <span>{added ? 'مضاف' : 'إضافة صديق'}</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => void realtimeClient.sendChallenge(peer.privateCode, 'wifi', useTimer)}
+                          className="inline-flex min-h-[40px] items-center gap-1.5 rounded-xl bg-[var(--accent-primary)] px-4 py-2 text-xs font-bold text-white"
+                        >
+                          <Swords className="h-4 w-4" /> تحدي
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            {/* Manual 6-digit fallback (Challenge OR Add Friend) */}
             <div className="rounded-xl border border-slate-200 bg-slate-50 p-4">
-              <p className="text-xs font-bold text-slate-800">بديل يدوي: أدخل الرقم الخاص لصديقك على الواي فاي</p>
-              <div className="mt-2 flex gap-2">
+              <p className="text-xs font-bold text-slate-800">
+                بديل يدوي: أدخل الرقم الخاص لصديقك (6 أرقام) لإضافته أو تحديه على الواي فاي
+              </p>
+              <div className="mt-2 flex flex-wrap gap-2">
                 <input
                   type="text"
                   maxLength={6}
@@ -909,14 +1038,21 @@ export const MultiplayerHubModal: React.FC<MultiplayerHubModalProps> = ({
                   value={manualCode}
                   onChange={(e) => setManualCode(e.target.value.replace(/\D/g, ''))}
                   placeholder="مثال: 482910"
-                  className="font-mono min-h-[42px] flex-1 rounded-xl border border-slate-200 bg-white px-3 text-center text-base font-bold tracking-widest"
+                  className="font-mono min-h-[42px] min-w-[140px] flex-1 rounded-xl border border-slate-200 bg-white px-3 text-center text-base font-bold tracking-widest"
                 />
                 <button
                   type="button"
-                  onClick={() => handleManualChallenge('wifi')}
-                  className="min-h-[42px] rounded-xl bg-[var(--accent-primary)] px-4 py-2 text-xs font-bold text-white"
+                  onClick={() => void handleManualAddFriend()}
+                  className="inline-flex min-h-[42px] items-center gap-1.5 rounded-xl border border-slate-300 bg-white px-3.5 py-2 text-xs font-bold text-slate-800 hover:bg-slate-100"
                 >
-                  إرسال تحدي
+                  <UserPlus className="h-4 w-4" /> إضافة صديق
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleManualChallenge('wifi')}
+                  className="inline-flex min-h-[42px] items-center gap-1.5 rounded-xl bg-[var(--accent-primary)] px-4 py-2 text-xs font-bold text-white"
+                >
+                  <Swords className="h-4 w-4" /> إرسال تحدي
                 </button>
               </div>
               {manualError && <p className="mt-1.5 text-xs font-bold text-rose-700">{manualError}</p>}
@@ -946,12 +1082,115 @@ export const MultiplayerHubModal: React.FC<MultiplayerHubModalProps> = ({
           </div>
         )}
 
-        {/* TAB 2: ONLINE PLAY BY 6-DIGIT PRIVATE CODE */}
+        {/* TAB 2: ONLINE PLAY BY 6-DIGIT PRIVATE CODE + LIVE SEARCH + SAVED FRIENDS */}
         {tab === 'online' && (
           <div className="space-y-4">
+            {/* Search by Name or 6-Digit Code */}
+            <div className="rounded-xl border border-slate-200 bg-white p-4">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <p className="text-xs font-extrabold text-slate-900">
+                  البحث عن الأصدقاء أونلاين بالاسم أو الرقم الخاص:
+                </p>
+                <button
+                  type="button"
+                  onClick={() => {
+                    onClose();
+                    onOpenComparisonModal();
+                  }}
+                  className="inline-flex min-h-[34px] items-center gap-1.5 rounded-lg border border-slate-200 bg-slate-50 px-3 py-1 text-xs font-bold text-slate-800 hover:bg-slate-100"
+                >
+                  <Table2 className="h-3.5 w-3.5 text-[var(--accent-primary)]" /> جدول المقارنة المفصل
+                </button>
+              </div>
+              <form
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  void realtimeClient.searchPeers(onlineSearch, 'online');
+                }}
+                className="mt-2.5 flex gap-2"
+              >
+                <div className="relative flex-1">
+                  <Search className="pointer-events-none absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+                  <input
+                    type="search"
+                    value={onlineSearch}
+                    onChange={(e) => setOnlineSearch(e.target.value)}
+                    placeholder="اكتب اسم الصديق أو رقمه الخاص (6 أرقام)..."
+                    className="min-h-[42px] w-full rounded-xl border border-slate-200 bg-slate-50 pl-3 pr-9 text-xs font-semibold text-slate-900 outline-none focus:border-[var(--accent-primary)]"
+                  />
+                </div>
+                <button
+                  type="submit"
+                  disabled={realtime.searchingPeers}
+                  className="min-h-[42px] rounded-xl bg-[var(--accent-primary)] px-4 py-2 text-xs font-bold text-white disabled:opacity-50"
+                >
+                  {realtime.searchingPeers ? 'جاري البحث...' : 'بحث'}
+                </button>
+              </form>
+              {realtime.searchError && (
+                <p className="mt-1.5 text-xs font-bold text-rose-700">{realtime.searchError}</p>
+              )}
+
+              {realtime.searchResults.length > 0 && (
+                <div className="mt-3 space-y-2 border-t border-slate-100 pt-3">
+                  <p className="text-[11px] font-bold text-slate-500">
+                    نتائج البحث المتصلة ({realtime.searchResults.length}):
+                  </p>
+                  {realtime.searchResults.map((peer) => {
+                    const added = isFriendAdded(peer.privateCode);
+                    return (
+                      <div
+                        key={peer.privateCode}
+                        className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-slate-200 bg-slate-50 px-3.5 py-2.5"
+                      >
+                        <div className="flex items-center gap-2.5">
+                          <AvatarView avatarId={peer.avatarId} size={36} />
+                          <div>
+                            <p className="text-xs font-extrabold text-slate-900">{peer.name}</p>
+                            <p className="text-[11px] text-slate-500">
+                              <span className="font-mono font-bold">#{peer.privateCode}</span> · المستوى{' '}
+                              {peer.levelId} ·{' '}
+                              <span className={peer.status === 'online' ? 'text-emerald-700' : 'text-amber-700'}>
+                                {peer.status === 'online' ? 'متصل الآن' : 'في لعبة'}
+                              </span>
+                            </p>
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-1.5">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const res = onAddFriendFromPeer(peer);
+                              setFriendFeedback({ ok: res.ok, text: res.message });
+                            }}
+                            className={`inline-flex min-h-[36px] items-center gap-1 rounded-lg border px-2.5 py-1 text-[11px] font-bold ${
+                              added
+                                ? 'border-emerald-200 bg-emerald-50 text-emerald-800'
+                                : 'border-slate-300 bg-white text-slate-800'
+                            }`}
+                          >
+                            {added ? <Check className="h-3.5 w-3.5" /> : <UserPlus className="h-3.5 w-3.5" />}
+                            <span>{added ? 'مضاف' : 'إضافة'}</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => void realtimeClient.sendChallenge(peer.privateCode, 'online', useTimer)}
+                            className="inline-flex min-h-[36px] items-center gap-1 rounded-lg bg-[var(--accent-primary)] px-3 py-1 text-[11px] font-bold text-white"
+                          >
+                            <Swords className="h-3.5 w-3.5" /> تحدي
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+
+            {/* Direct 6-digit Code Lookup / Add / Challenge */}
             <div className="rounded-xl border border-slate-200 bg-slate-50 p-4">
               <p className="text-xs font-bold text-slate-800">
-                أدخل الرقم الخاص لصديقك (6 أرقام) للعب أونلاين من أي مكان في العالم:
+                أو أدخل الرقم الخاص لصديقك (6 أرقام) مباشرة للتحقق أو الإضافة أو التحدي:
               </p>
               <div className="mt-2 flex flex-wrap gap-2">
                 <input
@@ -961,14 +1200,21 @@ export const MultiplayerHubModal: React.FC<MultiplayerHubModalProps> = ({
                   value={manualCode}
                   onChange={(e) => setManualCode(e.target.value.replace(/\D/g, ''))}
                   placeholder="482910"
-                  className="font-mono min-h-[44px] flex-1 rounded-xl border border-slate-200 bg-white px-3 text-center text-base font-bold tracking-widest"
+                  className="font-mono min-h-[44px] min-w-[140px] flex-1 rounded-xl border border-slate-200 bg-white px-3 text-center text-base font-bold tracking-widest"
                 />
                 <button
                   type="button"
-                  onClick={() => realtimeClient.lookupPeer(manualCode.trim())}
-                  className="min-h-[44px] rounded-xl border border-slate-300 bg-white px-4 py-2 text-xs font-bold text-slate-800"
+                  onClick={() => void realtimeClient.lookupPeer(manualCode.trim())}
+                  className="min-h-[44px] rounded-xl border border-slate-300 bg-white px-3.5 py-2 text-xs font-bold text-slate-800"
                 >
                   تحقق من الحالة
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void handleManualAddFriend()}
+                  className="inline-flex min-h-[44px] items-center gap-1.5 rounded-xl border border-emerald-300 bg-emerald-50 px-3.5 py-2 text-xs font-bold text-emerald-900"
+                >
+                  <UserPlus className="h-4 w-4" /> إضافة صديق
                 </button>
                 <button
                   type="button"
@@ -980,16 +1226,21 @@ export const MultiplayerHubModal: React.FC<MultiplayerHubModalProps> = ({
               </div>
               {manualError && <p className="mt-1.5 text-xs font-bold text-rose-700">{manualError}</p>}
               {realtime.lookupError && <p className="mt-1.5 text-xs font-bold text-rose-700">{realtime.lookupError}</p>}
+              {friendFeedback && (
+                <p className={`mt-1.5 text-xs font-bold ${friendFeedback.ok ? 'text-emerald-700' : 'text-rose-700'}`}>
+                  {friendFeedback.text}
+                </p>
+              )}
             </div>
 
             {realtime.lookedUpPeer && (
-              <div className="flex items-center justify-between rounded-xl border border-slate-200 bg-white p-4">
+              <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-slate-200 bg-white p-4">
                 <div className="flex items-center gap-3">
                   <AvatarView avatarId={realtime.lookedUpPeer.avatarId} size={40} />
                   <div>
                     <p className="text-sm font-extrabold text-slate-900">{realtime.lookedUpPeer.name}</p>
                     <p className="text-xs text-slate-500">
-                      #{realtime.lookedUpPeer.privateCode} ·{' '}
+                      #{realtime.lookedUpPeer.privateCode} · المستوى {realtime.lookedUpPeer.levelId} ·{' '}
                       <span
                         className={
                           realtime.lookedUpPeer.status === 'online'
@@ -1008,15 +1259,61 @@ export const MultiplayerHubModal: React.FC<MultiplayerHubModalProps> = ({
                     </p>
                   </div>
                 </div>
-                {realtime.lookedUpPeer.status === 'online' && (
+                <div className="flex items-center gap-2">
                   <button
                     type="button"
-                    onClick={() => realtimeClient.sendChallenge(realtime.lookedUpPeer!.privateCode, 'online', useTimer)}
-                    className="rounded-xl bg-[var(--accent-primary)] px-4 py-2 text-xs font-bold text-white"
+                    onClick={() => {
+                      const res = onAddFriendFromPeer(realtime.lookedUpPeer!);
+                      setFriendFeedback({ ok: res.ok, text: res.message });
+                    }}
+                    className="inline-flex min-h-[38px] items-center gap-1 rounded-xl border border-slate-200 bg-slate-50 px-3 py-1.5 text-xs font-bold text-slate-800"
                   >
-                    إرسال تحدي
+                    <UserPlus className="h-3.5 w-3.5" /> إضافة للقائمة
                   </button>
-                )}
+                  {realtime.lookedUpPeer.status === 'online' && (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        void realtimeClient.sendChallenge(realtime.lookedUpPeer!.privateCode, 'online', useTimer)
+                      }
+                      className="min-h-[38px] rounded-xl bg-[var(--accent-primary)] px-4 py-1.5 text-xs font-bold text-white"
+                    >
+                      إرسال تحدي
+                    </button>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {/* Quick Challenge Saved Friends */}
+            {savedFriendsWithCode.length > 0 && (
+              <div className="rounded-xl border border-slate-200 bg-white p-4">
+                <p className="text-xs font-extrabold text-slate-800">أصدقاؤك المضافون ({savedFriendsWithCode.length}):</p>
+                <div className="mt-2.5 grid gap-2 sm:grid-cols-2">
+                  {savedFriendsWithCode.map((fr) => (
+                    <div
+                      key={fr.code}
+                      className="flex items-center justify-between gap-2 rounded-xl border border-slate-100 bg-slate-50 px-3 py-2 text-xs"
+                    >
+                      <div className="flex items-center gap-2">
+                        <AvatarView avatarId={fr.avatarId || 'avatar-scholar'} size={32} />
+                        <div>
+                          <p className="font-extrabold text-slate-900">{fr.name}</p>
+                          <p className="font-mono text-[11px] text-slate-500">
+                            #{fr.privateCode} · {fr.level}
+                          </p>
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => void realtimeClient.sendChallenge(fr.privateCode!, 'online', useTimer)}
+                        className="rounded-lg bg-[var(--accent-primary)] px-3 py-1.5 text-[11px] font-bold text-white"
+                      >
+                        تحدي
+                      </button>
+                    </div>
+                  ))}
+                </div>
               </div>
             )}
           </div>

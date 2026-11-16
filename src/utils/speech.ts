@@ -17,12 +17,15 @@ interface AndroidTTSBridge {
   stop: () => void;
   openInstallVoiceData: () => void;
   openAppSettings: () => void;
+  hasRecordAudioPermission?: () => boolean;
+  requestRecordAudioPermission?: () => void;
 }
 
 declare global {
   interface Window {
     AndroidTTS?: AndroidTTSBridge;
     __onAndroidTTSEvent?: (speechId: string, type: string, detail: string) => void;
+    __onAndroidMicPermission?: (granted: boolean) => void;
   }
 }
 
@@ -160,14 +163,253 @@ export function openDeviceVoiceDownload(): void {
   });
 }
 
-export function openDeviceAppPermissions(): void {
+export function openDeviceAppPermissions(): 'android' | 'web' {
   if (typeof window !== 'undefined' && window.AndroidTTS) {
     try {
       window.AndroidTTS.openAppSettings();
+      return 'android';
     } catch {
-      // Ignore
+      // Fall through to web guidance
     }
   }
+  return 'web';
+}
+
+export type MicPermissionState = 'granted' | 'denied' | 'prompt' | 'unknown';
+
+export async function queryMicrophonePermissionState(): Promise<MicPermissionState> {
+  if (typeof window === 'undefined') return 'unknown';
+  try {
+    if (window.AndroidTTS?.hasRecordAudioPermission) {
+      const hasNative = window.AndroidTTS.hasRecordAudioPermission();
+      if (!hasNative) return 'prompt';
+    }
+  } catch {
+    // Ignore native bridge error
+  }
+
+  try {
+    if (navigator.permissions && typeof navigator.permissions.query === 'function') {
+      const status = await navigator.permissions.query({ name: 'microphone' as PermissionName });
+      if (status.state === 'granted' || status.state === 'denied' || status.state === 'prompt') {
+        return status.state;
+      }
+    }
+  } catch {
+    // Safari / WebView without permissions.query('microphone')
+  }
+
+  try {
+    if (window.AndroidTTS?.hasRecordAudioPermission?.()) {
+      return 'granted';
+    }
+  } catch {
+    // Ignore
+  }
+
+  return 'unknown';
+}
+
+export async function requestNativeAndroidMicPermission(): Promise<boolean | null> {
+  if (typeof window === 'undefined' || !window.AndroidTTS?.requestRecordAudioPermission) {
+    return null;
+  }
+  try {
+    if (window.AndroidTTS.hasRecordAudioPermission?.()) {
+      return true;
+    }
+    return await new Promise<boolean>((resolve) => {
+      let settled = false;
+      const prevHandler = window.__onAndroidMicPermission;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        window.__onAndroidMicPermission = prevHandler;
+        resolve(Boolean(window.AndroidTTS?.hasRecordAudioPermission?.()));
+      }, 15_000);
+
+      window.__onAndroidMicPermission = (granted: boolean) => {
+        prevHandler?.(granted);
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        window.__onAndroidMicPermission = prevHandler;
+        resolve(Boolean(granted));
+      };
+
+      window.AndroidTTS?.requestRecordAudioPermission?.();
+    });
+  } catch {
+    return null;
+  }
+}
+
+export type MicAccessResult =
+  | { ok: true; stream: MediaStream }
+  | { ok: false; reason: 'denied' | 'unsupported' | 'busy' | 'iframe_blocked'; message: string };
+
+export async function ensureMicrophoneStream(): Promise<MicAccessResult> {
+  if (typeof window === 'undefined' || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    return {
+      ok: false,
+      reason: 'unsupported',
+      message: 'المتصفح الحالي لا يدعم الوصول للميكروفون.',
+    };
+  }
+
+  // On Capacitor Android APK, ensure runtime RECORD_AUDIO is granted before WebView AUDIO_CAPTURE request
+  const nativePerm = await requestNativeAndroidMicPermission();
+  if (nativePerm === false) {
+    return {
+      ok: false,
+      reason: 'denied',
+      message: 'يرجى الموافقة على إذن الميكروفون من إعدادات التطبيق في الهاتف ثم إعادة المحاولة.',
+    };
+  }
+
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      },
+      video: false,
+    });
+    return { ok: true, stream };
+  } catch (err) {
+    const errName = err instanceof Error ? err.name : '';
+
+    // Retry with plain { audio: true } when specific audio processing constraints fail on device/WebView
+    if (errName === 'OverconstrainedError' || errName === 'ConstraintNotSatisfiedError' || errName === 'TypeError') {
+      try {
+        const fallbackStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+        return { ok: true, stream: fallbackStream };
+      } catch {
+        // Proceed to error classification below
+      }
+    }
+
+    const permState = await queryMicrophonePermissionState();
+    const isIframe = (() => {
+      try {
+        return window.self !== window.top;
+      } catch {
+        return true;
+      }
+    })();
+
+    if (errName === 'NotAllowedError' || errName === 'PermissionDeniedError' || errName === 'SecurityError') {
+      // If browser/Android reports permission IS ALREADY granted, don't falsely claim permission wasn't given!
+      if (permState === 'granted') {
+        try {
+          const retryStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+          return { ok: true, stream: retryStream };
+        } catch {
+          if (isIframe) {
+            return {
+              ok: false,
+              reason: 'iframe_blocked',
+              message:
+                'تم منح إذن الميكروفون، لكن نافذة العرض المضمّنة تحجب الصوت. افتح التطبيق في تبويب متصفح مستقل.',
+            };
+          }
+          return {
+            ok: false,
+            reason: 'busy',
+            message:
+              'إذن الميكروفون مفعّل بالفعل، لكن النظام يمنع فتح المايك حالياً. أغلق أي تطبيق آخر يستخدم المايك وأعد المحاولة.',
+          };
+        }
+      }
+
+      if (isIframe) {
+        return {
+          ok: false,
+          reason: 'denied',
+          message:
+            'تأكد من السماح للميكروفون من أيقونة القفل في شريط المتصفح، أو افتح التطبيق في تبويب مستقل.',
+        };
+      }
+      return {
+        ok: false,
+        reason: 'denied',
+        message: 'يرجى السماح بصلاحية الميكروفون من المتصفح أو إعدادات التطبيق ثم الضغط على إعادة المحاولة.',
+      };
+    }
+
+    if (errName === 'NotFoundError' || errName === 'DevicesNotFoundError') {
+      return {
+        ok: false,
+        reason: 'unsupported',
+        message: 'لم يتم العثور على ميكروفون متصل بهذا الجهاز.',
+      };
+    }
+
+    return {
+      ok: false,
+      reason: 'busy',
+      message: 'تعذر تشغيل الميكروفون حالياً، تأكد أنه غير مستخدم من تطبيق آخر وحاول مجدداً.',
+    };
+  }
+}
+
+export function subscribeMicPermissionChanges(onGranted: () => void): () => void {
+  if (typeof window === 'undefined') return () => {};
+  let disposed = false;
+  let permStatus: PermissionStatus | null = null;
+
+  const checkNow = async () => {
+    if (disposed) return;
+    const state = await queryMicrophonePermissionState();
+    if (state === 'granted' && !disposed) {
+      onGranted();
+    }
+  };
+
+  if (navigator.permissions && typeof navigator.permissions.query === 'function') {
+    navigator.permissions
+      .query({ name: 'microphone' as PermissionName })
+      .then((status) => {
+        if (disposed) return;
+        permStatus = status;
+        if (status.state === 'granted') {
+          onGranted();
+        }
+        status.onchange = () => {
+          if (status.state === 'granted' && !disposed) {
+            onGranted();
+          }
+        };
+      })
+      .catch(() => {});
+  }
+
+  const onFocus = () => {
+    void checkNow();
+  };
+  const onVis = () => {
+    if (document.visibilityState === 'visible') {
+      void checkNow();
+    }
+  };
+
+  const prevNativeCb = window.__onAndroidMicPermission;
+  window.__onAndroidMicPermission = (granted: boolean) => {
+    prevNativeCb?.(granted);
+    if (granted && !disposed) onGranted();
+  };
+
+  window.addEventListener('focus', onFocus);
+  document.addEventListener('visibilitychange', onVis);
+
+  return () => {
+    disposed = true;
+    if (permStatus) permStatus.onchange = null;
+    window.removeEventListener('focus', onFocus);
+    document.removeEventListener('visibilitychange', onVis);
+    window.__onAndroidMicPermission = prevNativeCb;
+  };
 }
 
 export interface SpeakOptions {
