@@ -1,8 +1,57 @@
-import type { CEFRLevel, CEFRLevelId, Lesson, LessonQuestion, SkillTag } from '../types';
-import { LEVELS_A1_B1_SEEDS, type RawLessonSeed } from './levelsA1B1';
+import type {
+  CEFRLevel,
+  CEFRLevelId,
+  Lesson,
+  LessonQuestion,
+  QuestionTargetWord,
+  SkillTag,
+  WordMasteryRecord,
+} from '../types';
+import { LEVELS_A1_B1_SEEDS, type RawLessonSeed, type RawVocab } from './levelsA1B1';
 import { LEVELS_B2_C2_SEEDS } from './levelsB2C2';
+import { buildSrsPracticeQuestions, getDueSrsVocab, getWeakSrsVocab } from '../services/srs';
 
 export const CEFR_ORDER: CEFRLevelId[] = ['A1', 'A2', 'B1', 'B2', 'C1', 'C2'];
+
+export function shuffleWithSeed<T>(items: T[], seedStr: string): T[] {
+  const arr = [...items];
+  let h = 2166136261;
+  for (let i = 0; i < seedStr.length; i++) {
+    h ^= seedStr.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  for (let i = arr.length - 1; i > 0; i--) {
+    h ^= h << 13;
+    h ^= h >>> 17;
+    h ^= h << 5;
+    const j = Math.abs(h) % (i + 1);
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+
+function hashSeed(seedStr: string): number {
+  let h = 2166136261;
+  for (let i = 0; i < seedStr.length; i++) {
+    h ^= seedStr.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return Math.abs(h);
+}
+
+function toTargetWord(v: RawVocab, idx: number, seed: RawLessonSeed): QuestionTargetWord {
+  return {
+    vocabId: `${seed.id}-V${idx + 1}`,
+    word: v.word,
+    ar: v.ar,
+    example: v.example,
+    exampleAr: v.exampleAr,
+    phonetic: v.phonetic,
+    pos: v.pos,
+    lessonId: seed.id,
+    levelId: seed.levelId,
+  };
+}
 
 export const SKILL_LABELS: Record<SkillTag, string> = {
   vocab: 'المفردات',
@@ -52,15 +101,38 @@ function buildQuestionsFromSeed(seed: RawLessonSeed): LessonQuestion[] {
   const v2 = seed.vocab[2] ?? seed.vocab[0];
   const v3 = seed.vocab[3] ?? seed.vocab[1] ?? seed.vocab[0];
   const v4 = seed.vocab[4] ?? seed.vocab[2] ?? seed.vocab[0];
+  const v5 = seed.vocab[5] ?? seed.vocab[2] ?? seed.vocab[0];
 
-  const distractorPool = seed.vocab.map((v) => v.ar);
-
-  const mcqOptions = Array.from(new Set([v0.ar, v1.ar, v2.ar, v3.ar]));
-  while (mcqOptions.length < 4 && distractorPool.length > 0) {
-    const candidate = distractorPool[mcqOptions.length % distractorPool.length];
-    if (!mcqOptions.includes(candidate)) mcqOptions.push(candidate);
+  const distractorPoolAr = seed.vocab.map((v) => v.ar);
+  const rawMcqAr = Array.from(new Set([v0.ar, v1.ar, v2.ar, v3.ar]));
+  while (rawMcqAr.length < 4 && distractorPoolAr.length > 0) {
+    const candidate = distractorPoolAr[rawMcqAr.length % distractorPoolAr.length];
+    if (!rawMcqAr.includes(candidate)) rawMcqAr.push(candidate);
     else break;
   }
+  const mcqOptionsAr = shuffleWithSeed(rawMcqAr, `${seed.id}-Q1`);
+
+  const distractorPoolEn = seed.vocab.map((v) => v.word);
+  const rawMcqEn = Array.from(new Set([v5.word, v0.word, v1.word, v3.word]));
+  while (rawMcqEn.length < 4 && distractorPoolEn.length > 0) {
+    const candidate = distractorPoolEn[rawMcqEn.length % distractorPoolEn.length];
+    if (!rawMcqEn.includes(candidate)) rawMcqEn.push(candidate);
+    else break;
+  }
+  const mcqOptionsEn = shuffleWithSeed(rawMcqEn, `${seed.id}-Q8`);
+
+  const q2IsTrue = hashSeed(`${seed.id}-Q2`) % 2 === 0;
+  const q9IsTrue = !q2IsTrue; // Ensures balanced 50% صح / 50% خطأ across every lesson
+
+  const q2DisplayedAr = q2IsTrue ? v1.ar : v2.ar !== v1.ar ? v2.ar : v0.ar;
+  const q2Answer = q2DisplayedAr === v1.ar ? 'صح' : 'خطأ';
+
+  const q9DisplayedAr = q9IsTrue ? v2.ar : v4.ar !== v2.ar ? v4.ar : v0.ar;
+  const q9Answer = q9DisplayedAr === v2.ar ? 'صح' : 'خطأ';
+
+  const escapedV4 = v4.word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const maskedPrompt = v4.example.replace(new RegExp(escapedV4, 'i'), '____');
+  const safeFillPrompt = maskedPrompt.includes('____') ? maskedPrompt : `${v4.example} (____)`;
 
   return [
     {
@@ -72,9 +144,10 @@ function buildQuestionsFromSeed(seed: RawLessonSeed): LessonQuestion[] {
       prompt: v0.word,
       promptAr: 'اختر المعنى العربي الصحيح للكلمة:',
       audioText: v0.word,
-      options: mcqOptions,
+      options: mcqOptionsAr,
       answer: v0.ar,
       explanation: `كلمة "${v0.word}" تعني "${v0.ar}". مثال: ${v0.example}`,
+      targetWord: toTargetWord(v0, 0, seed),
     },
     {
       id: `${seed.id}-Q2`,
@@ -82,12 +155,16 @@ function buildQuestionsFromSeed(seed: RawLessonSeed): LessonQuestion[] {
       level_id: seed.levelId,
       skill_tag: 'vocab',
       type: 'tf',
-      prompt: `هل معنى "${v1.word}" هو "${v2.ar}"؟`,
+      prompt: `هل معنى "${v1.word}" هو "${q2DisplayedAr}"؟`,
       promptAr: 'تحقق من صحة المعنى (صح أم خطأ):',
       audioText: v1.word,
       options: ['صح', 'خطأ'],
-      answer: v1.ar === v2.ar ? 'صح' : 'خطأ',
-      explanation: `المعنى الصحيح لكلمة "${v1.word}" هو "${v1.ar}" وليس "${v2.ar}".`,
+      answer: q2Answer,
+      explanation:
+        q2Answer === 'صح'
+          ? `إجابة صحيحة! كلمة "${v1.word}" تعني فعلاً "${v1.ar}".`
+          : `المعنى الصحيح لكلمة "${v1.word}" هو "${v1.ar}" وليس "${q2DisplayedAr}".`,
+      targetWord: toTargetWord(v1, 1, seed),
     },
     {
       id: `${seed.id}-Q3`,
@@ -97,7 +174,7 @@ function buildQuestionsFromSeed(seed: RawLessonSeed): LessonQuestion[] {
       type: 'mcq',
       prompt: seed.grammarQ.prompt,
       promptAr: seed.grammarQ.promptAr,
-      options: seed.grammarQ.options,
+      options: shuffleWithSeed(seed.grammarQ.options, `${seed.id}-Q3`),
       answer: seed.grammarQ.answer,
       explanation: seed.grammarQ.explanation,
     },
@@ -112,6 +189,7 @@ function buildQuestionsFromSeed(seed: RawLessonSeed): LessonQuestion[] {
       audioText: v3.word,
       answer: v3.word,
       explanation: `الكلمة المنطوقة هي "${v3.word}" ومعناها "${v3.ar}".`,
+      targetWord: toTargetWord(v3, 3, seed),
     },
     {
       id: `${seed.id}-Q5`,
@@ -133,7 +211,7 @@ function buildQuestionsFromSeed(seed: RawLessonSeed): LessonQuestion[] {
       type: 'mcq',
       prompt: seed.readingQ.passage,
       promptAr: seed.readingQ.question,
-      options: seed.readingQ.options,
+      options: shuffleWithSeed(seed.readingQ.options, `${seed.id}-Q6`),
       answer: seed.readingQ.answer,
       explanation: seed.readingQ.explanation,
     },
@@ -143,14 +221,46 @@ function buildQuestionsFromSeed(seed: RawLessonSeed): LessonQuestion[] {
       level_id: seed.levelId,
       skill_tag: 'vocab',
       type: 'fill',
-      prompt: v4.example.replace(new RegExp(v4.word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i'), '____'),
+      prompt: safeFillPrompt,
       promptAr: `أكمل الفراغ بالكلمة المناسبة (معناها: ${v4.ar}):`,
       audioText: v4.example,
       answer: v4.word,
       explanation: `الكلمة الناقصة هي "${v4.word}" (${v4.ar}).`,
+      targetWord: toTargetWord(v4, 4, seed),
     },
     {
       id: `${seed.id}-Q8`,
+      lesson_id: seed.id,
+      level_id: seed.levelId,
+      skill_tag: 'vocab',
+      type: 'mcq',
+      prompt: v5.ar,
+      promptAr: 'اختر الكلمة الإنجليزية المطابقة للمعنى:',
+      audioText: v5.word,
+      options: mcqOptionsEn,
+      answer: v5.word,
+      explanation: `المعنى "${v5.ar}" يقابله بالإنجليزية "${v5.word}". مثال: ${v5.example}`,
+      targetWord: toTargetWord(v5, Math.min(5, seed.vocab.length - 1), seed),
+    },
+    {
+      id: `${seed.id}-Q9`,
+      lesson_id: seed.id,
+      level_id: seed.levelId,
+      skill_tag: 'vocab',
+      type: 'tf',
+      prompt: `هل معنى "${v2.word}" هو "${q9DisplayedAr}"؟`,
+      promptAr: 'تحقق من صحة المعنى (صح أم خطأ):',
+      audioText: v2.word,
+      options: ['صح', 'خطأ'],
+      answer: q9Answer,
+      explanation:
+        q9Answer === 'صح'
+          ? `إجابة صحيحة! كلمة "${v2.word}" تعني فعلاً "${v2.ar}".`
+          : `المعنى الصحيح لكلمة "${v2.word}" هو "${v2.ar}" وليس "${q9DisplayedAr}".`,
+      targetWord: toTargetWord(v2, 2, seed),
+    },
+    {
+      id: `${seed.id}-Q10`,
       lesson_id: seed.id,
       level_id: seed.levelId,
       skill_tag: 'pronunciation',
@@ -238,7 +348,8 @@ export function getAdaptiveReviewQuestions(
   completedLessons: Record<string, number>,
   currentLessonId: string,
   skills: Record<SkillTag, { correct: number; attempts: number }>,
-): { questions: LessonQuestion[]; weakestSkills: SkillTag[]; focusNote: string } {
+  vocabProgress?: Record<string, WordMasteryRecord>,
+): { questions: LessonQuestion[]; weakestSkills: SkillTag[]; focusNote: string; dueSrsCount: number } {
   // Only draw from unlocked/studied lessons — never future locked lessons!
   const studiedLessons = ALL_LESSONS.filter(
     (l) => unlockedLevelIds.includes(l.levelId) && (completedLessons[l.id] !== undefined || l.id === currentLessonId),
@@ -265,6 +376,24 @@ export function getAdaptiveReviewQuestions(
 
   let focusNote = `تركيز تلقائي على أضعف مهارتين: ${SKILL_LABELS[weakestSkills[0]]} و${SKILL_LABELS[weakestSkills[1]]}.`;
 
+  // Inject due / weak SRS words from unlocked levels only
+  const srsDue = vocabProgress ? getDueSrsVocab(vocabProgress, Date.now(), unlockedLevelIds, 4) : [];
+  const srsWeak =
+    vocabProgress && srsDue.length < 3
+      ? getWeakSrsVocab(vocabProgress, unlockedLevelIds, 4 - srsDue.length)
+      : [];
+  const combinedSrs = [...srsDue];
+  for (const w of srsWeak) {
+    if (!combinedSrs.some((d) => d.wordKey === w.wordKey)) combinedSrs.push(w);
+  }
+  const studiedVocabPool = ALL_LESSONS.filter((l) => unlockedLevelIds.includes(l.levelId)).flatMap(
+    (l) => l.vocabulary,
+  );
+  const srsQuestions =
+    combinedSrs.length > 0
+      ? buildSrsPracticeQuestions(combinedSrs.slice(0, 4), studiedVocabPool, 'SRS-REV')
+      : [];
+
   // Rule 1: If pronunciation < 50%, dedicate 60% (6 out of 10) to pronunciation exercises
   if (pronPct < 50) {
     focusNote = 'نطقك يحتاج دفعة إضافية (< 50%): خصصنا 60% من مراجعة اليوم لتمارين النطق!';
@@ -272,7 +401,6 @@ export function getAdaptiveReviewQuestions(
     for (let i = 0; i < 6 && i < pronPool.length; i++) {
       pushUnique(pronPool[i]);
     }
-    // If studied lessons had fewer than 6 pronunciation items, synthesize pronunciation drills from studied vocabulary
     const vocabItems = safeLessons.flatMap((l) =>
       l.vocabulary.map((v) => ({ lessonId: l.id, levelId: l.levelId, vocab: v })),
     );
@@ -294,6 +422,14 @@ export function getAdaptiveReviewQuestions(
     }
   }
 
+  for (const q of srsQuestions) {
+    if (selected.length >= 10) break;
+    pushUnique(q);
+  }
+  if (srsDue.length > 0 && pronPct >= 50) {
+    focusNote = `تشمل المراجعة ${srsDue.length} كلمات مستحقة للتكرار المتباعد (SRS) مع التركيز على ${SKILL_LABELS[weakestSkills[0]]}.`;
+  }
+
   // Rule 2: If weak in sentence_building, focus on word ordering & building
   if (weakestSkills.includes('sentence_building')) {
     const orderPool = pool.filter((q) => q.skill_tag === 'sentence_building');
@@ -301,7 +437,7 @@ export function getAdaptiveReviewQuestions(
       if (selected.length >= 8) break;
       pushUnique(q);
     }
-    if (pronPct >= 50) {
+    if (pronPct >= 50 && srsDue.length === 0) {
       focusNote = 'ركزنا مراجعة اليوم على ترتيب الكلمات وبناء الجمل لتقوية مهارتك في الصياغة.';
     }
   }
@@ -313,7 +449,7 @@ export function getAdaptiveReviewQuestions(
       if (selected.length >= 10) break;
       pushUnique(q);
     }
-    if (pronPct >= 50 && !weakestSkills.includes('sentence_building')) {
+    if (pronPct >= 50 && !weakestSkills.includes('sentence_building') && srsDue.length === 0) {
       focusNote = 'ركزنا المراجعة على قواعد درسك الحالي لتثبيتها قبل الانتقال.';
     }
   }
@@ -329,7 +465,7 @@ export function getAdaptiveReviewQuestions(
     pushUnique(q);
   }
 
-  return { questions: selected.slice(0, 10), weakestSkills, focusNote };
+  return { questions: selected.slice(0, 10), weakestSkills, focusNote, dueSrsCount: srsDue.length };
 }
 
 export function getLocalSudaneseExplanation(query: string, levelId: CEFRLevelId): string {

@@ -65,6 +65,9 @@ export function createInitialState(): AppState {
     lastRankOrder: [],
     rivalDailyOffsetDate: '',
     rivalXpOverrides: {},
+    rivalStates: {},
+    rivalLastTickAt: 0,
+    vocabProgress: {},
     friends: [],
     savedWords: [],
     matchHistory: [],
@@ -86,6 +89,14 @@ function hydrateState(base: AppState, parsed: Partial<AppState>): AppState {
     profile: mergedProfile,
     settings: { ...base.settings, ...(parsed.settings || {}) },
     skills: { ...base.skills, ...(parsed.skills || {}) },
+    rivalStates:
+      parsed.rivalStates && typeof parsed.rivalStates === 'object' ? parsed.rivalStates : base.rivalStates,
+    rivalLastTickAt:
+      typeof parsed.rivalLastTickAt === 'number' ? parsed.rivalLastTickAt : base.rivalLastTickAt,
+    vocabProgress:
+      parsed.vocabProgress && typeof parsed.vocabProgress === 'object'
+        ? parsed.vocabProgress
+        : base.vocabProgress,
     savedWords: Array.isArray(parsed.savedWords) ? parsed.savedWords : base.savedWords,
     matchHistory: Array.isArray(parsed.matchHistory) ? parsed.matchHistory : base.matchHistory,
   };

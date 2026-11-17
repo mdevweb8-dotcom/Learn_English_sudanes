@@ -460,7 +460,7 @@ export const LEVELS_B2_C2_SEEDS: RawLessonSeed[] = [
       { word: 'Ambiguous', pos: 'Adj', ar: 'غامض', phonetic: '/æmˈbɪɡjuəs/', example: 'His reply was somewhat ambiguous.', exampleAr: 'كان رده غامضاً إلى حد ما.' },
       { word: 'Amend', pos: 'V', ar: 'يعدّل', phonetic: '/əˈmend/', example: 'They voted to amend the policy.', exampleAr: 'صوّتوا على تعديل السياسة.' },
       { word: 'Analogous', pos: 'Adj', ar: 'مماثل', phonetic: '/əˈnæləɡəs/', example: 'The system is analogous to a compass.', exampleAr: 'النظام مماثل للبوصلة.' },
-      { word: 'Anomaly', pos: 'N', ar: 'شذوذ / حالة شاذة', phonetic: '/əˈnɑːməli/', example: 'Statistical anomalies require careful review.', exampleAr: 'الحالات الشاذة إحصائياً تتطلب مراجعة دقيقة.' },
+      { word: 'Anomaly', pos: 'N', ar: 'شذوذ / حالة شاذة', phonetic: '/əˈnɑːməli/', example: 'A statistical anomaly requires careful review.', exampleAr: 'الحالة الشاذة إحصائياً تتطلب مراجعة دقيقة.' },
       { word: 'Articulate', pos: 'Adj/V', ar: 'يتكلم بوضوح / بليغ', phonetic: '/ɑːrˈtɪkjulət/', example: 'She is an articulate speaker.', exampleAr: 'هي متحدثة بليغة.' },
     ],
     grammarQ: {
@@ -798,7 +798,7 @@ export const LEVELS_B2_C2_SEEDS: RawLessonSeed[] = [
       { word: 'Fluctuate', pos: 'V', ar: 'يتذبذب / يتقلب', phonetic: '/ˈflʌktʃueɪt/', example: 'Crop prices fluctuate according to the season.', exampleAr: 'تتذبذب أسعار المحاصيل حسب الموسم.' },
       { word: 'Futile', pos: 'Adj', ar: 'عديم الجدوى', phonetic: '/ˈfjuːtaɪl/', example: 'Arguing without facts is futile.', exampleAr: 'الجدال بلا حقائق عديم الجدوى.' },
       { word: 'Holistic', pos: 'Adj', ar: 'شمولي', phonetic: '/hoʊˈlɪstɪk/', example: 'A holistic approach addresses root causes.', exampleAr: 'النهج الشمولي يعالج الأسباب الجذرية.' },
-      { word: 'Hypothesis', pos: 'N', ar: 'فرضية', phonetic: '/haɪˈpɑːθəsɪs/', example: 'Scientists tested several climate hypotheses.', exampleAr: 'اختبر العلماء عدة فرضيات مناخية.' },
+      { word: 'Hypothesis', pos: 'N', ar: 'فرضية', phonetic: '/haɪˈpɑːθəsɪs/', example: 'Scientists tested a new climate hypothesis.', exampleAr: 'اختبر العلماء فرضية مناخية جديدة.' },
       { word: 'Impartial', pos: 'Adj', ar: 'محايد / نزيه', phonetic: '/ɪmˈpɑːrʃəl/', example: 'A fair judge must remain impartial.', exampleAr: 'يجب أن يظل القاضي العادل محايداً.' },
     ],
     grammarQ: {

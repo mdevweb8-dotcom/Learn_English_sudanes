@@ -10,9 +10,11 @@ import {
   History,
   LogOut,
   Play,
+  Radio,
   RefreshCw,
   RotateCcw,
   Search,
+  Server,
   Swords,
   Table2,
   TimerOff,
@@ -70,6 +72,8 @@ export const MultiplayerHubModal: React.FC<MultiplayerHubModalProps> = ({
   const [useTimer, setUseTimer] = useState(true);
   const [copiedCode, setCopiedCode] = useState(false);
   const [lanInput, setLanInput] = useState(state.profile.lanServerUrl || '');
+  const [hostBusy, setHostBusy] = useState(false);
+  const [hostError, setHostError] = useState('');
 
   // Team creation / join inputs
   const [teamNameInput, setTeamNameInput] = useState(`فريق ${state.profile.name}`);
@@ -102,12 +106,15 @@ export const MultiplayerHubModal: React.FC<MultiplayerHubModalProps> = ({
       const pollId = setInterval(() => {
         void realtimeClient.discoverWifi();
       }, 4500);
-      return () => clearInterval(pollId);
+      return () => {
+        clearInterval(pollId);
+        void realtimeClient.stopWifiDiscovery();
+      };
     }
     if (tab === 'online') {
       void realtimeClient.searchPeers(onlineSearch, 'online');
     }
-  }, [tab, realtime.connected, realtime.registeredCode, room]);
+  }, [tab, realtime.connected, realtime.registeredCode, realtime.wifiConnected, room]);
 
   // Countdown for outgoing challenge (30s)
   useEffect(() => {
@@ -153,7 +160,7 @@ export const MultiplayerHubModal: React.FC<MultiplayerHubModalProps> = ({
           // Time expired for this question -> submit wrong and show answer
           setAnsweredThisQ(true);
           setLastWasCorrect(false);
-          realtimeClient.submitGameAnswer(false, qIndex + 1);
+          realtimeClient.submitGameAnswer(false, qIndex + 1, '', qIndex);
           return 0;
         }
         return prev - 1;
@@ -192,6 +199,18 @@ export const MultiplayerHubModal: React.FC<MultiplayerHubModalProps> = ({
   }, [room?.status, room?.roomId]);
 
   const currentQuestion = room?.questions?.[qIndex];
+
+  const displayedMcqOptions = useMemo(() => {
+    if (!currentQuestion?.options) return [];
+    if (currentQuestion.type !== 'mcq') return currentQuestion.options;
+    const arr = [...currentQuestion.options];
+    for (let i = arr.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+    return arr;
+  }, [currentQuestion?.id, qIndex]);
+
   const shuffledOrderWords = useMemo(() => {
     if (!currentQuestion?.wordsToOrder) return [];
     return [...currentQuestion.wordsToOrder].sort((a, b) => a.localeCompare(b));
@@ -213,6 +232,22 @@ export const MultiplayerHubModal: React.FC<MultiplayerHubModalProps> = ({
     [state.friends],
   );
 
+  const handleToggleWifiHost = async () => {
+    setHostError('');
+    setHostBusy(true);
+    try {
+      if (realtime.wifiHostStatus.active) {
+        await realtimeClient.stopWifiHost();
+      } else {
+        await realtimeClient.startWifiHost();
+      }
+    } catch (err) {
+      setHostError(err instanceof Error ? err.message : 'تعذر تشغيل خادم الاستضافة المحلي.');
+    } finally {
+      setHostBusy(false);
+    }
+  };
+
   const handleManualChallenge = (mode: ConnectionMode) => {
     const clean = manualCode.trim();
     if (!/^\d{6}$/.test(clean)) {
@@ -224,9 +259,7 @@ export const MultiplayerHubModal: React.FC<MultiplayerHubModalProps> = ({
       return;
     }
     setManualError('');
-    if (mode === 'online') {
-      void realtimeClient.lookupPeer(clean);
-    }
+    void realtimeClient.lookupPeer(clean, mode);
     void realtimeClient.sendChallenge(clean, mode, useTimer);
   };
 
@@ -248,15 +281,17 @@ export const MultiplayerHubModal: React.FC<MultiplayerHubModalProps> = ({
   const handleConfirmQuizAnswer = () => {
     if (!currentQuestion || answeredThisQ) return;
     let correct = false;
+    let submitted = selectedOpt;
     if (currentQuestion.type === 'order') {
-      const built = orderedWords.map((o) => o.word).join(' ').trim().toLowerCase();
-      correct = built === currentQuestion.answer.trim().toLowerCase();
+      const built = orderedWords.map((o) => o.word).join(' ').trim();
+      submitted = built;
+      correct = built.toLowerCase() === currentQuestion.answer.trim().toLowerCase();
     } else {
       correct = selectedOpt === currentQuestion.answer;
     }
     setAnsweredThisQ(true);
     setLastWasCorrect(correct);
-    realtimeClient.submitGameAnswer(correct, qIndex + 1);
+    realtimeClient.submitGameAnswer(correct, qIndex + 1, submitted, qIndex);
   };
 
   const handleNextQuestion = () => {
@@ -481,9 +516,9 @@ export const MultiplayerHubModal: React.FC<MultiplayerHubModalProps> = ({
                 </div>
 
                 {/* Options */}
-                {(currentQuestion.type === 'mcq' || currentQuestion.type === 'tf') && currentQuestion.options && (
+                {(currentQuestion.type === 'mcq' || currentQuestion.type === 'tf') && displayedMcqOptions.length > 0 && (
                   <div className="mt-4 grid gap-2.5 sm:grid-cols-2">
-                    {currentQuestion.options.map((opt) => {
+                    {displayedMcqOptions.map((opt) => {
                       const picked = selectedOpt === opt;
                       const isAns = opt === currentQuestion.answer;
                       let cls = 'border-slate-200 bg-white text-slate-900 hover:border-[var(--accent-primary)]';
@@ -805,13 +840,22 @@ export const MultiplayerHubModal: React.FC<MultiplayerHubModalProps> = ({
             </div>
           </div>
 
-          <div className="text-xs font-bold">
+          <div className="space-y-1 text-xs font-bold">
             {realtime.codeConflictError ? (
               <span className="text-rose-700">تعارض رقم على الشبكة! غيّر رقمك</span>
-            ) : realtime.connected ? (
-              <span className="text-emerald-700">متصل بالخادم الفوري ✓</span>
             ) : (
-              <span className="text-amber-700">جاري الاتصال...</span>
+              <>
+                <div className={realtime.wifiConnected ? 'text-emerald-700' : 'text-slate-500'}>
+                  {realtime.wifiHostStatus.active
+                    ? `مضيف Wi-Fi أوفلاين نشط (${realtime.wifiHostStatus.ip}:${realtime.wifiHostStatus.httpPort}) ✓`
+                    : realtime.wifiConnected
+                      ? 'متصل بخادم Wi-Fi المحلي ✓'
+                      : 'واي فاي محلي: غير متصل بمضيف'}
+                </div>
+                <div className={realtime.connected ? 'text-emerald-700' : 'text-amber-700'}>
+                  {realtime.connected ? 'أونلاين (الإنترنت): متصل ✓' : 'أونلاين: جاري الاتصال...'}
+                </div>
+              </>
             )}
           </div>
         </div>
@@ -898,12 +942,112 @@ export const MultiplayerHubModal: React.FC<MultiplayerHubModalProps> = ({
           </div>
         )}
 
-        {/* TAB 1: SAME WI-FI FRIENDS DISCOVERY + SEARCH + ADD FRIEND + MANUAL FALLBACK */}
+        {/* TAB 1: SAME WI-FI FRIENDS DISCOVERY + NATIVE HOST + NSD + MANUAL FALLBACK */}
         {tab === 'wifi' && (
           <div className="space-y-4">
+            {/* Native Offline Wi-Fi Host Card */}
+            <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4">
+              {realtime.wifiNativeSupported ? (
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <Server className="h-4 w-4 text-[var(--accent-primary)]" />
+                      <h3 className="text-sm font-extrabold text-slate-900">
+                        {realtime.wifiHostStatus.active
+                          ? 'خادم الاستضافة المحلي نشط الآن (بدون إنترنت)'
+                          : 'استضافة مباراة Wi-Fi أوفلاين (للمضيف)'}
+                      </h3>
+                    </div>
+                    {realtime.wifiHostStatus.active ? (
+                      <p className="mt-1 text-xs text-emerald-800 font-bold">
+                        العنوان: <span className="font-mono" dir="ltr">{realtime.wifiHostStatus.httpUrl}</span> ·
+                        اللاعبون المتصلون: <span className="font-mono">{realtime.wifiHostStatus.connectedCount}</span>
+                      </p>
+                    ) : (
+                      <p className="mt-1 text-xs text-slate-600">
+                        فعّل نقطة الاتصال (Hotspot) أو اتصل بنفس الواي فاي ثم اضغط استضافة ليكتشفك أصدقاؤك تلقائياً.
+                      </p>
+                    )}
+                  </div>
+                  <button
+                    type="button"
+                    disabled={hostBusy}
+                    onClick={() => void handleToggleWifiHost()}
+                    className={`inline-flex min-h-[42px] items-center gap-2 rounded-xl px-4 py-2 text-xs font-extrabold transition disabled:opacity-50 ${
+                      realtime.wifiHostStatus.active
+                        ? 'border border-rose-300 bg-rose-50 text-rose-800 hover:bg-rose-100'
+                        : 'bg-[var(--accent-primary)] text-white hover:bg-[var(--accent-primary-hover)]'
+                    }`}
+                  >
+                    <Radio className="h-4 w-4" />
+                    <span>
+                      {hostBusy
+                        ? 'جاري التنفيذ...'
+                        : realtime.wifiHostStatus.active
+                          ? 'إيقاف الاستضافة'
+                          : 'استضافة مباراة Wi-Fi'}
+                    </span>
+                  </button>
+                </div>
+              ) : (
+                <div className="text-xs text-slate-700 leading-relaxed">
+                  <p className="font-extrabold text-slate-900">ملاحظة (المتصفح / PWA):</p>
+                  <p className="mt-0.5">
+                    تشغيل خادم Wi-Fi أوفلاين المدمج والاكتشاف التلقائي (NSD/mDNS) يعملان تلقائياً داخل تطبيق الأندرويد (APK).
+                    للعب مع مضيف أندرويد من المتصفح على نفس نقطة الاتصال، أدخل عنوان المضيف الظاهر على هاتفه بالأسفل.
+                  </p>
+                </div>
+              )}
+              {hostError && <p className="mt-2 text-xs font-bold text-rose-700">{hostError}</p>}
+            </div>
+
+            {/* Auto-discovered mDNS Wi-Fi Hosts */}
+            {realtime.wifiDiscoveredHosts.length > 0 && (
+              <div className="space-y-2 rounded-xl border border-emerald-200 bg-emerald-50/60 p-4">
+                <p className="text-xs font-extrabold text-emerald-950">
+                  مضيفون مكتشفون تلقائياً على نفس الواي فاي ({realtime.wifiDiscoveredHosts.length}):
+                </p>
+                {realtime.wifiDiscoveredHosts.map((host) => (
+                  <div
+                    key={`${host.ip}-${host.httpPort}-${host.privateCode}`}
+                    className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-emerald-200 bg-white px-3.5 py-2.5"
+                  >
+                    <div className="flex items-center gap-2.5">
+                      <AvatarView avatarId={host.avatarId || 'avatar-scholar'} size={38} />
+                      <div>
+                        <p className="text-sm font-extrabold text-slate-900">{host.name}</p>
+                        <p className="text-xs text-slate-500">
+                          الرقم: <span className="font-mono font-bold">{host.privateCode}</span> · المستوى {host.levelId}{' '}
+                          · <span className="font-mono text-[11px]" dir="ltr">{host.ip}:{host.httpPort}</span>
+                        </p>
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() =>
+                          realtimeClient.connectWifiEndpoint({ httpUrl: host.httpUrl, wsUrl: host.wsUrl })
+                        }
+                        className="min-h-[38px] rounded-xl border border-slate-200 bg-slate-50 px-3 py-1.5 text-xs font-bold text-slate-800"
+                      >
+                        اتصال فقط
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => void realtimeClient.challengeDiscoveredHost(host, useTimer)}
+                        className="inline-flex min-h-[38px] items-center gap-1.5 rounded-xl bg-[var(--accent-primary)] px-3.5 py-1.5 text-xs font-extrabold text-white"
+                      >
+                        <Swords className="h-4 w-4" /> إرسال تحدي
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+
             <div className="flex flex-wrap items-center justify-between gap-2">
               <h3 className="text-sm font-extrabold text-slate-900">
-                الأجهزة المكتشفة على نفس شبكة الواي فاي ({filteredWifiPeers.length})
+                الأصدقاء المتصلون على الشبكة المحلية ({filteredWifiPeers.length})
               </h3>
               <div className="flex items-center gap-2">
                 <button
@@ -923,7 +1067,7 @@ export const MultiplayerHubModal: React.FC<MultiplayerHubModalProps> = ({
                   className="inline-flex min-h-[38px] items-center gap-1.5 rounded-xl border border-slate-200 px-3 py-1.5 text-xs font-bold text-slate-700 hover:bg-slate-50 disabled:opacity-50"
                 >
                   <RefreshCw className={`h-3.5 w-3.5 ${realtime.wifiLoading ? 'animate-spin' : ''}`} />{' '}
-                  {realtime.wifiLoading ? 'جاري البحث...' : 'تحديث البحث'}
+                  {realtime.wifiLoading ? 'جاري البحث...' : 'البحث عن الأصدقاء'}
                 </button>
               </div>
             </div>
@@ -942,10 +1086,10 @@ export const MultiplayerHubModal: React.FC<MultiplayerHubModalProps> = ({
               </div>
               <button
                 type="button"
-                onClick={() => void realtimeClient.searchPeers(wifiSearch, 'all')}
+                onClick={() => void realtimeClient.searchPeers(wifiSearch, 'wifi')}
                 className="min-h-[42px] rounded-xl border border-slate-300 bg-slate-50 px-3.5 text-xs font-bold text-slate-800 hover:bg-slate-100"
               >
-                بحث شامل
+                بحث محلي
               </button>
             </div>
 
@@ -970,8 +1114,10 @@ export const MultiplayerHubModal: React.FC<MultiplayerHubModalProps> = ({
             {filteredWifiPeers.length === 0 ? (
               <div className="rounded-xl border border-dashed border-slate-300 bg-slate-50 p-5 text-center text-xs text-slate-500">
                 {wifiSearch.trim()
-                  ? 'لا توجد نتائج مطابقة على نفس الشبكة — جرب البحث الشامل أو أدخل الرقم الخاص أدناه.'
-                  : 'لم يُكتشف أصدقاء على نفس الواي فاي بعد — اطلب من صديقك فتح التطبيق، أو أدخل رقمه الخاص أدناه!'}
+                  ? 'لا توجد نتائج مطابقة على نفس الشبكة.'
+                  : realtime.wifiHostStatus.active
+                    ? 'أنت الآن المضيف! اطلب من صديقك فتح "أصدقاء الواي فاي" والضغط على البحث عن الأصدقاء للانضمام إليك.'
+                    : 'لم يُكتشف أصدقاء بعد — افتح الاستضافة على أحد الهاتفين واضغط البحث عن الأصدقاء في الهاتف الآخر.'}
               </div>
             ) : (
               <div className="space-y-2">

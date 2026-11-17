@@ -29,6 +29,18 @@ export interface SavedWord extends VocabItem {
   savedAt: string;
 }
 
+export interface QuestionTargetWord {
+  word: string;
+  ar: string;
+  example: string;
+  exampleAr: string;
+  levelId: CEFRLevelId;
+  lessonId: string;
+  vocabId?: string;
+  phonetic?: string;
+  pos?: string;
+}
+
 export interface LessonQuestion {
   id: string;
   lesson_id: string;
@@ -42,6 +54,32 @@ export interface LessonQuestion {
   wordsToOrder?: string[];
   answer: string;
   explanation: string;
+  targetWord?: QuestionTargetWord;
+}
+
+export type VocabMasteryStage = 'new' | 'learning' | 'reviewing' | 'mastered';
+
+export interface WordMasteryRecord {
+  wordKey: string;
+  vocabId?: string;
+  word: string;
+  ar: string;
+  example: string;
+  exampleAr: string;
+  phonetic?: string;
+  pos?: string;
+  levelId: CEFRLevelId;
+  lessonId: string;
+  seenCount: number;
+  correctCount: number;
+  wrongCount: number;
+  consecutiveCorrect: number;
+  easeFactor: number;
+  intervalDays: number;
+  mastery: VocabMasteryStage;
+  lastReviewedAt: string;
+  nextReviewAt: string;
+  lastResult: 'correct' | 'wrong';
 }
 
 export interface Lesson {
@@ -88,12 +126,35 @@ export interface PronunciationRecord {
   timestamp: string;
 }
 
+export type RivalPersonality = 'steady' | 'sprinter' | 'calm' | 'sporadic' | 'challenger';
+
 export interface Rival {
   id: string;
   name: string;
   avatarId: string;
+  personality: RivalPersonality;
+  personalityLabel: string;
   baseDailyRate: number;
+  activeProbability: number;
+  weekendBoost: number;
   tagline: string;
+}
+
+export interface RivalProgressState {
+  rivalId: string;
+  levelId: CEFRLevelId;
+  xp: number;
+  lessonsCompleted: number;
+  skillPct: number;
+  streak: number;
+  lastGainXp: number;
+  isActiveToday: boolean;
+  lastActiveDate: string;
+  weeklyGainDate: string;
+  weeklyGainXp: number;
+  dailyGainDate: string;
+  dailyGainXp: number;
+  lastUpdatedAt: number;
 }
 
 export interface RivalStanding {
@@ -105,6 +166,12 @@ export interface RivalStanding {
   isUser: boolean;
   title?: string;
   tagline?: string;
+  personalityLabel?: string;
+  lastGainXp?: number;
+  isActiveToday?: boolean;
+  streak?: number;
+  lessonsCompleted?: number;
+  skillPct?: number;
 }
 
 export interface ShopItem {
@@ -153,6 +220,36 @@ export interface PeerInfo {
   completedLessons?: number;
   avgSkill?: number;
   unlockedLevels?: CEFRLevelId[];
+  hostIp?: string;
+  httpPort?: number;
+  wsPort?: number;
+  isHost?: boolean;
+}
+
+export interface DiscoveredWifiHost {
+  serviceName: string;
+  privateCode: string;
+  name: string;
+  avatarId: string;
+  levelId: CEFRLevelId;
+  ip: string;
+  httpPort: number;
+  wsPort: number;
+  httpUrl: string;
+  wsUrl: string;
+  discoveredAt: number;
+}
+
+export interface WifiHostStatus {
+  active: boolean;
+  ip: string;
+  httpPort: number;
+  wsPort: number;
+  httpUrl: string;
+  wsUrl: string;
+  connectedCount: number;
+  serviceName: string;
+  error?: string | null;
 }
 
 export interface ChallengeInvite {
@@ -268,6 +365,9 @@ export interface AppState {
   lastRankOrder: string[];
   rivalDailyOffsetDate: string;
   rivalXpOverrides: Record<string, number>;
+  rivalStates: Record<string, RivalProgressState>;
+  rivalLastTickAt: number;
+  vocabProgress: Record<string, WordMasteryRecord>;
   friends: FriendComparison[];
   savedWords: SavedWord[];
   matchHistory: MatchRecord[];

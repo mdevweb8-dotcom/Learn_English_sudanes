@@ -10,7 +10,7 @@ import {
   X,
   XCircle,
 } from 'lucide-react';
-import type { LessonQuestion, Rival, SkillTag } from '../types';
+import type { LessonQuestion, QuestionTargetWord, Rival, SkillTag } from '../types';
 import { SKILL_LABELS } from '../data/curriculum';
 import { SpeakButton } from './SpeakButton';
 import { PronunciationLab, type PronunciationResult } from './PronunciationLab';
@@ -26,6 +26,7 @@ export interface QuizSessionOutcome {
   xpEarned: number;
   coinsEarned: number;
   skillEvents: Array<{ skill: SkillTag; correct: boolean }>;
+  vocabEvents: Array<{ targetWord: QuestionTargetWord; correct: boolean }>;
   pronunciationRecords: PronunciationResult[];
   beatRival?: boolean;
   rivalName?: string;
@@ -108,12 +109,19 @@ export const QuizEngine: React.FC<QuizEngineProps> = ({
   const [mistakesCount, setMistakesCount] = useState(0);
   const [xpEarned, setXpEarned] = useState(0);
   const [skillEvents, setSkillEvents] = useState<Array<{ skill: SkillTag; correct: boolean }>>([]);
+  const [vocabEvents, setVocabEvents] = useState<Array<{ targetWord: QuestionTargetWord; correct: boolean }>>([]);
   const [pronRecords, setPronRecords] = useState<PronunciationResult[]>([]);
   const [finished, setFinished] = useState(false);
   const [rivalScore, setRivalScore] = useState(0);
 
   const currentItem = queue[currentIndex];
   const currentQ = currentItem?.question;
+
+  const displayedOptions = useMemo(() => {
+    if (!currentQ?.options) return [];
+    if (currentQ.type !== 'mcq') return currentQ.options;
+    return shuffleWords(currentQ.options);
+  }, [currentItem?.instanceKey]);
 
   const availableOrderWords = useMemo(() => {
     if (!currentQ || currentQ.type !== 'order' || !currentQ.wordsToOrder) return [];
@@ -185,6 +193,10 @@ export const QuizEngine: React.FC<QuizEngineProps> = ({
     setIsCurrentCorrect(correct);
     setScoredInstanceKeys((prev) => ({ ...prev, [currentItem.instanceKey]: true }));
     setSkillEvents((prev) => [...prev, { skill: currentQ.skill_tag, correct }]);
+    if (currentQ.targetWord) {
+      const tw = currentQ.targetWord;
+      setVocabEvents((prev) => [...prev, { targetWord: tw, correct }]);
+    }
 
     if (rivalChallenge) {
       const rivalGetsPoint = Math.random() < rivalChallenge.rivalTargetAccuracy;
@@ -333,6 +345,7 @@ export const QuizEngine: React.FC<QuizEngineProps> = ({
                     xpEarned,
                     coinsEarned,
                     skillEvents,
+                    vocabEvents,
                     pronunciationRecords: pronRecords,
                     beatRival,
                     rivalName: rivalChallenge?.rival.name,
@@ -453,9 +466,9 @@ export const QuizEngine: React.FC<QuizEngineProps> = ({
 
           {/* Question Input Areas */}
           <div className="mt-5">
-            {(currentQ.type === 'mcq' || currentQ.type === 'tf') && currentQ.options && (
+            {(currentQ.type === 'mcq' || currentQ.type === 'tf') && displayedOptions.length > 0 && (
               <div className={`grid gap-3 ${currentQ.type === 'tf' ? 'grid-cols-2' : 'grid-cols-1 sm:grid-cols-2'}`}>
-                {currentQ.options.map((opt) => {
+                {displayedOptions.map((opt) => {
                   const isSelected = selectedOption === opt;
                   const isAnswer = opt === currentQ.answer;
                   let style = 'border-slate-200 bg-white text-slate-900 hover:border-[var(--accent-primary)]';

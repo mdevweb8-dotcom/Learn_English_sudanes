@@ -62,7 +62,13 @@ import {
   removeOfflineLevelBundle,
   saveOfflineLevelBundle,
 } from './services/storage';
-import { computeRivalStandings, detectRankCrossing } from './services/rivals';
+import {
+  computeRivalStandings,
+  detectRankCrossing,
+  simulateManualRivalStep,
+  syncAndAdvanceRivals,
+} from './services/rivals';
+import { recordVocabOutcome, seedLessonVocabSeen } from './services/srs';
 import { initNativeCapacitor, sendNativeNotification, triggerHaptic } from './services/native';
 import { realtimeClient, type RealtimeState } from './services/realtime';
 import { AvatarView } from './components/AvatarView';
@@ -138,13 +144,19 @@ export default function App() {
           nextStreak = 0;
         }
         const dailyXp = chosen.dailyDate === today ? chosen.dailyXp : 0;
-
-        return {
+        const hydratedCandidate: AppState = {
           ...chosen,
           streak: nextStreak,
           dailyXp,
           dailyDate: today,
           offlineLevels: cachedOffline.length > 0 ? cachedOffline : chosen.offlineLevels,
+        };
+        const syncedRivals = syncAndAdvanceRivals(hydratedCandidate, Date.now());
+
+        return {
+          ...hydratedCandidate,
+          rivalStates: syncedRivals.rivalStates,
+          rivalLastTickAt: syncedRivals.rivalLastTickAt,
         };
       });
     })();
@@ -152,6 +164,22 @@ export default function App() {
     return () => {
       mounted = false;
     };
+  }, []);
+
+  // Autonomous AI rival progression tick every 60 seconds (idempotent, respects rest days & caps)
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setState((prev) => {
+        const synced = syncAndAdvanceRivals(prev, Date.now());
+        if (!synced.changed) return prev;
+        return {
+          ...prev,
+          rivalStates: synced.rivalStates,
+          rivalLastTickAt: synced.rivalLastTickAt,
+        };
+      });
+    }, 60_000);
+    return () => clearInterval(timer);
   }, []);
 
   // Persist dual localStorage + IndexedDB on state updates
@@ -288,6 +316,15 @@ export default function App() {
       };
     }
 
+    // SRS vocabulary mastery progression
+    let nextVocabProgress = prev.vocabProgress;
+    if (outcome.vocabEvents && outcome.vocabEvents.length > 0) {
+      const nowMs = Date.now();
+      for (const ev of outcome.vocabEvents) {
+        nextVocabProgress = recordVocabOutcome(nextVocabProgress, ev.targetWord, ev.correct, nowMs);
+      }
+    }
+
     // Pronunciation records
     const newPronRecords = outcome.pronunciationRecords.map((r, idx) => ({
       id: `pr-${Date.now()}-${idx}`,
@@ -322,6 +359,7 @@ export default function App() {
       dailyXp: (prev.dailyDate === today ? prev.dailyXp : 0) + totalXpGain,
       dailyDate: today,
       skills: nextSkills,
+      vocabProgress: nextVocabProgress,
       pronunciationHistory: [...newPronRecords, ...prev.pronunciationHistory].slice(0, 60),
       excellentPronunciations: nextExcellentPron,
       challengesWon: nextChallengesWon,
@@ -375,6 +413,7 @@ export default function App() {
       const nextBest = Math.max(prevBest, outcome.scorePercent);
       return {
         ...updated,
+        vocabProgress: seedLessonVocabSeen(updated.vocabProgress, lesson),
         completedLessons: {
           ...updated.completedLessons,
           [lesson.id]: nextBest,
@@ -473,17 +512,20 @@ export default function App() {
   };
 
   const handleSimulateRivalTick = () => {
+    const nowMs = Date.now();
+    let notice = '';
     setState((prev) => {
-      const picked = RIVALS[Math.floor(Math.random() * RIVALS.length)];
-      const bump = Math.floor(Math.random() * 45) + 35;
+      const res = simulateManualRivalStep(prev, nowMs);
+      notice = `⚡ ${res.bumpedRivalName} أنهى جلسة تدريب (+${res.deltaXp} XP)`;
       return {
         ...prev,
-        rivalXpOverrides: {
-          ...prev.rivalXpOverrides,
-          [picked.id]: (prev.rivalXpOverrides[picked.id] ?? 0) + bump,
-        },
+        rivalStates: res.rivalStates,
+        rivalLastTickAt: nowMs,
       };
     });
+    if (notice) {
+      pushToast(notice, 'info');
+    }
   };
 
   const handleBuyOrEquipShopItem = (item: ShopItem): { ok: boolean; message: string } => {
@@ -589,7 +631,13 @@ export default function App() {
       return { ok: false, message: 'هذا رقمك الخاص! أدخل رقم صديقك المكون من 6 أرقام.' };
     }
 
-    const peer = await realtimeClient.lookupPeer(sixDigits);
+    let peer = realtime.connected ? await realtimeClient.lookupPeer(sixDigits, 'online') : null;
+    if ((!peer || peer.status === 'offline') && realtime.wifiConnected) {
+      peer = await realtimeClient.lookupPeer(sixDigits, 'wifi');
+    }
+    if (!peer && !realtime.connected && !realtime.wifiConnected) {
+      peer = await realtimeClient.lookupPeer(sixDigits, 'online');
+    }
     if (!peer || peer.status === 'offline') {
       return {
         ok: false,
@@ -622,7 +670,13 @@ export default function App() {
     if (!/^\d{6}$/.test(clean)) {
       return { ok: false, message: 'لا يوجد رقم خاص من 6 أرقام لتحديث هذا الصديق.' };
     }
-    const peer = await realtimeClient.lookupPeer(clean);
+    let peer = realtime.connected ? await realtimeClient.lookupPeer(clean, 'online') : null;
+    if ((!peer || peer.status === 'offline') && realtime.wifiConnected) {
+      peer = await realtimeClient.lookupPeer(clean, 'wifi');
+    }
+    if (!peer && !realtime.connected && !realtime.wifiConnected) {
+      peer = await realtimeClient.lookupPeer(clean, 'online');
+    }
     if (!peer || peer.status === 'offline') {
       return { ok: false, message: `الصديق (${clean}) غير متصل حالياً لتحديث إحصائياته.` };
     }
@@ -634,10 +688,12 @@ export default function App() {
   const handleChallengeSavedFriend = (privateCode: string) => {
     const clean = privateCode.trim();
     if (!/^\d{6}$/.test(clean)) return;
+    const preferWifi = realtime.wifiConnected && !realtime.connected;
+    const mode = preferWifi ? 'wifi' : 'online';
     setFriendsModalOpen(false);
-    setMultiplayerTab('online');
-    void realtimeClient.lookupPeer(clean);
-    void realtimeClient.sendChallenge(clean, 'online', true);
+    setMultiplayerTab(mode);
+    void realtimeClient.lookupPeer(clean, mode);
+    void realtimeClient.sendChallenge(clean, mode, true);
     pushToast(`تم إرسال طلب التحدي إلى الصديق (${clean})!`, 'info');
   };
 
@@ -769,8 +825,9 @@ export default function App() {
         state.completedLessons,
         nextStudyLesson.id,
         state.skills,
+        state.vocabProgress,
       ),
-    [state.unlockedLevels, state.completedLessons, nextStudyLesson.id, state.skills],
+    [state.unlockedLevels, state.completedLessons, nextStudyLesson.id, state.skills, state.vocabProgress],
   );
 
   const dailyChallengeQuestions = useMemo(() => {

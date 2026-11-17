@@ -11,8 +11,15 @@ import {
   TrendingUp,
 } from 'lucide-react';
 import type { AppState, LessonQuestion, SkillTag } from '../types';
-import { CEFR_LEVELS, SKILL_LABELS } from '../data/curriculum';
+import { ALL_LESSONS, CEFR_LEVELS, SKILL_LABELS, shuffleWithSeed } from '../data/curriculum';
 import { getSkillScorePercent } from '../services/storage';
+import {
+  buildSrsPracticeQuestions,
+  getDueSrsVocab,
+  getWeakSrsVocab,
+  makeWordKey,
+  summarizeVocabProgress,
+} from '../services/srs';
 import { SpeakButton } from './SpeakButton';
 import { QuizEngine, type QuizSessionOutcome } from './QuizEngine';
 
@@ -45,7 +52,7 @@ export const AnalyticsView: React.FC<AnalyticsViewProps> = ({
   onAskTeacher,
 }) => {
   const [subTab, setSubTab] = useState<'skills' | 'vocab_log'>('skills');
-  const [practiceOpen, setPracticeOpen] = useState(false);
+  const [practiceMode, setPracticeMode] = useState<'saved' | 'srs' | null>(null);
 
   const skillRows = ALL_SKILLS.map((tag) => {
     const stat = state.skills[tag];
@@ -91,25 +98,52 @@ export const AnalyticsView: React.FC<AnalyticsViewProps> = ({
   const currentLessonTitle =
     CEFR_LEVELS.flatMap((l) => l.lessons).find((l) => l.id === currentLessonId)?.title || 'الدرس الحالي';
 
+  const srsSummary = useMemo(() => summarizeVocabProgress(state.vocabProgress), [state.vocabProgress]);
+
+  const unlockedVocabPool = useMemo(
+    () => ALL_LESSONS.filter((l) => state.unlockedLevels.includes(l.levelId)).flatMap((l) => l.vocabulary),
+    [state.unlockedLevels],
+  );
+
+  const srsPracticeQuestions: LessonQuestion[] = useMemo(() => {
+    const due = getDueSrsVocab(state.vocabProgress, Date.now(), state.unlockedLevels, 10);
+    const weak = due.length < 6 ? getWeakSrsVocab(state.vocabProgress, state.unlockedLevels, 10 - due.length) : [];
+    const merged = [...due];
+    for (const w of weak) {
+      if (!merged.some((m) => m.wordKey === w.wordKey)) merged.push(w);
+    }
+    return buildSrsPracticeQuestions(merged.slice(0, 10), unlockedVocabPool, 'SRS-LOG');
+  }, [state.vocabProgress, state.unlockedLevels, unlockedVocabPool]);
+
   const savedPracticeQuestions: LessonQuestion[] = useMemo(() => {
     const words = state.savedWords;
     if (words.length === 0) return [];
-    const globalArPool = [
-      ...words.map((w) => w.ar),
-      'يتعلم بسرعة',
-      'يطور مهاراته',
-      'يقرأ بوضوح',
-      'يتواصل بثقة',
-    ];
+    const globalArPool = Array.from(
+      new Set([...words.map((w) => w.ar), ...unlockedVocabPool.map((v) => v.ar)]),
+    );
+    const globalEnPool = Array.from(
+      new Set([...words.map((w) => w.word), ...unlockedVocabPool.map((v) => v.word)]),
+    );
+
     return words.slice(0, 12).map((w, idx) => {
-      const distractors = Array.from(new Set(globalArPool.filter((a) => a !== w.ar))).slice(0, 3);
-      const options = [w.ar, ...distractors].sort((a, b) => a.localeCompare(b));
-      const useListen = idx % 3 === 2;
-      if (useListen) {
+      const lessonLevelId = ALL_LESSONS.find((l) => l.id === w.lessonId)?.levelId ?? 'A1';
+      const targetWord = {
+        vocabId: w.id,
+        word: w.word,
+        ar: w.ar,
+        example: w.example,
+        exampleAr: w.exampleAr,
+        phonetic: w.phonetic,
+        pos: w.pos,
+        lessonId: w.lessonId,
+        levelId: lessonLevelId,
+      };
+      const mode = idx % 3;
+      if (mode === 2) {
         return {
           id: `SAVED-L-${w.id}`,
           lesson_id: w.lessonId,
-          level_id: 'A1',
+          level_id: lessonLevelId,
           skill_tag: 'listening',
           type: 'listen',
           prompt: 'استمع للكلمة المحفوظة ثم اكتبها بالإنجليزية',
@@ -117,12 +151,39 @@ export const AnalyticsView: React.FC<AnalyticsViewProps> = ({
           audioText: w.word,
           answer: w.word,
           explanation: `الكلمة المحفوظة هي "${w.word}" ومعناها "${w.ar}". مثال: ${w.example}`,
+          targetWord,
         };
       }
+      if (mode === 1) {
+        const distractors = shuffleWithSeed(
+          globalEnPool.filter((en) => en.toLowerCase() !== w.word.toLowerCase()),
+          `saved-en-${w.id}`,
+        ).slice(0, 3);
+        const options = shuffleWithSeed([w.word, ...distractors], `saved-en-opts-${w.id}`);
+        return {
+          id: `SAVED-EN-${w.id}`,
+          lesson_id: w.lessonId,
+          level_id: lessonLevelId,
+          skill_tag: 'vocab',
+          type: 'mcq',
+          prompt: w.ar,
+          promptAr: 'اختر الكلمة الإنجليزية الصحيحة لهذا المعنى:',
+          audioText: w.word,
+          options,
+          answer: w.word,
+          explanation: `"${w.word}" (${w.pos}) معناها "${w.ar}". مثال: ${w.example}`,
+          targetWord,
+        };
+      }
+      const distractors = shuffleWithSeed(
+        globalArPool.filter((a) => a !== w.ar),
+        `saved-ar-${w.id}`,
+      ).slice(0, 3);
+      const options = shuffleWithSeed([w.ar, ...distractors], `saved-ar-opts-${w.id}`);
       return {
         id: `SAVED-Q-${w.id}`,
         lesson_id: w.lessonId,
-        level_id: 'A1',
+        level_id: lessonLevelId,
         skill_tag: 'vocab',
         type: 'mcq',
         prompt: w.word,
@@ -131,9 +192,10 @@ export const AnalyticsView: React.FC<AnalyticsViewProps> = ({
         options,
         answer: w.ar,
         explanation: `"${w.word}" (${w.pos}) معناها "${w.ar}". مثال: ${w.example}`,
+        targetWord,
       };
     });
-  }, [state.savedWords]);
+  }, [state.savedWords, unlockedVocabPool]);
 
   return (
     <div className="space-y-5">
@@ -176,17 +238,60 @@ export const AnalyticsView: React.FC<AnalyticsViewProps> = ({
               </p>
             </div>
 
-            {state.savedWords.length > 0 && (
-              <button
-                type="button"
-                onClick={() => setPracticeOpen(true)}
-                className="inline-flex min-h-[44px] items-center gap-2 rounded-xl bg-[var(--accent-primary)] px-4 py-2.5 text-xs font-extrabold text-white transition hover:bg-[var(--accent-primary-hover)]"
-              >
-                <Play className="h-4 w-4" />
-                <span>اختبر نفسك في كلماتك المحفوظة ({Math.min(12, state.savedWords.length)})</span>
-              </button>
-            )}
+            <div className="flex flex-wrap items-center gap-2">
+              {srsPracticeQuestions.length > 0 && (
+                <button
+                  type="button"
+                  onClick={() => setPracticeMode('srs')}
+                  className="inline-flex min-h-[44px] items-center gap-2 rounded-xl border border-emerald-600 bg-emerald-50 px-4 py-2 text-xs font-extrabold text-emerald-800 transition hover:bg-emerald-100"
+                >
+                  <Sparkles className="h-4 w-4" />
+                  <span>اختبر الكلمات المستحقة SRS ({srsPracticeQuestions.length})</span>
+                </button>
+              )}
+
+              {state.savedWords.length > 0 && (
+                <button
+                  type="button"
+                  onClick={() => setPracticeMode('saved')}
+                  className="inline-flex min-h-[44px] items-center gap-2 rounded-xl bg-[var(--accent-primary)] px-4 py-2.5 text-xs font-extrabold text-white transition hover:bg-[var(--accent-primary-hover)]"
+                >
+                  <Play className="h-4 w-4" />
+                  <span>اختبر كلماتك المحفوظة ({Math.min(12, state.savedWords.length)})</span>
+                </button>
+              )}
+            </div>
           </div>
+
+          {/* SRS Vocabulary Mastery Overview Strip */}
+          {srsSummary.total > 0 && (
+            <div className="grid grid-cols-2 gap-2.5 rounded-xl border border-slate-200 bg-slate-50/70 p-3.5 text-center sm:grid-cols-4">
+              <div>
+                <div className="font-mono text-lg font-extrabold text-emerald-700 tabular-nums">
+                  {srsSummary.masteredCount}
+                </div>
+                <div className="text-[11px] font-bold text-slate-600">كلمات متقنة</div>
+              </div>
+              <div>
+                <div className="font-mono text-lg font-extrabold text-sky-700 tabular-nums">
+                  {srsSummary.reviewingCount + srsSummary.learningCount}
+                </div>
+                <div className="text-[11px] font-bold text-slate-600">قيد التعلّم والمراجعة</div>
+              </div>
+              <div>
+                <div className="font-mono text-lg font-extrabold text-rose-700 tabular-nums">
+                  {srsSummary.weakCount}
+                </div>
+                <div className="text-[11px] font-bold text-slate-600">تحتاج تقوية</div>
+              </div>
+              <div>
+                <div className="font-mono text-lg font-extrabold text-amber-700 tabular-nums">
+                  {srsSummary.dueCount}
+                </div>
+                <div className="text-[11px] font-bold text-slate-600">مستحقة الآن</div>
+              </div>
+            </div>
+          )}
 
           {state.savedWords.length === 0 ? (
             <div className="py-10 text-center">
@@ -198,7 +303,25 @@ export const AnalyticsView: React.FC<AnalyticsViewProps> = ({
             </div>
           ) : (
             <div className="grid gap-3 sm:grid-cols-2">
-              {state.savedWords.map((w) => (
+              {state.savedWords.map((w) => {
+                const srsRec = state.vocabProgress[makeWordKey(w.word)];
+                const stageLabel =
+                  srsRec?.mastery === 'mastered'
+                    ? 'متقنة'
+                    : srsRec?.mastery === 'reviewing'
+                      ? 'قيد المراجعة'
+                      : srsRec?.mastery === 'learning'
+                        ? srsRec.wrongCount > 0
+                          ? 'تحتاج تقوية'
+                          : 'قيد التعلّم'
+                        : 'جديدة';
+                const stageColor =
+                  srsRec?.mastery === 'mastered'
+                    ? 'text-emerald-700'
+                    : srsRec?.wrongCount
+                      ? 'text-rose-700'
+                      : 'text-slate-500';
+                return (
                 <div
                   key={w.id}
                   className="flex flex-col justify-between rounded-2xl border border-slate-200 bg-slate-50/50 p-4"
@@ -206,11 +329,12 @@ export const AnalyticsView: React.FC<AnalyticsViewProps> = ({
                   <div>
                     <div className="flex items-start justify-between gap-2">
                       <div>
-                        <div className="flex items-center gap-2">
+                        <div className="flex flex-wrap items-center gap-2">
                           <h3 className="font-en text-lg font-extrabold text-slate-900" dir="ltr">
                             {w.word}
                           </h3>
                           <span className="font-mono text-xs text-slate-400">({w.pos})</span>
+                          <span className={`text-[11px] font-bold ${stageColor}`}>· {stageLabel}</span>
                         </div>
                         <p className="mt-1 text-sm font-bold text-[var(--accent-text)]">{w.ar}</p>
                         <p className="mt-0.5 text-xs text-slate-500">النطق: {w.phonetic}</p>
@@ -247,7 +371,8 @@ export const AnalyticsView: React.FC<AnalyticsViewProps> = ({
                     </div>
                   </div>
                 </div>
-              ))}
+                );
+              })}
             </div>
           )}
         </div>
@@ -454,17 +579,21 @@ export const AnalyticsView: React.FC<AnalyticsViewProps> = ({
         </>
       )}
 
-      {practiceOpen && (
+      {practiceMode && (
         <QuizEngine
-          title="اختبار الكلمات المحفوظة"
-          subtitle="مراجعة مخصصة من سجل مفرداتك"
-          questions={savedPracticeQuestions}
+          title={practiceMode === 'srs' ? 'مراجعة المفردات المستحقة (SRS)' : 'اختبار الكلمات المحفوظة'}
+          subtitle={
+            practiceMode === 'srs'
+              ? 'تدريب تلقائي على الكلمات التي أخطأت بها أو حان موعد مراجعتها'
+              : 'مراجعة مخصصة من سجل مفرداتك'
+          }
+          questions={practiceMode === 'srs' ? srsPracticeQuestions : savedPracticeQuestions}
           passThreshold={60}
           isKids={isKids}
           onAskTeacher={onAskTeacher}
-          onClose={() => setPracticeOpen(false)}
+          onClose={() => setPracticeMode(null)}
           onComplete={(outcome) => {
-            setPracticeOpen(false);
+            setPracticeMode(null);
             onPracticeSavedComplete(outcome);
           }}
         />

@@ -300,6 +300,15 @@ const MULTIPLAYER_BANK: Record<string, ServerQuestion[]> = {
   ],
 };
 
+function shuffleArray<T>(items: T[]): T[] {
+  const arr = [...items];
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+
 function getQuestionsForLevel(levelId: string): ServerQuestion[] {
   const base = MULTIPLAYER_BANK[levelId] || MULTIPLAYER_BANK.A1;
   const extra = levelId === 'A1' ? MULTIPLAYER_BANK.A2 : MULTIPLAYER_BANK.A1;
@@ -308,7 +317,9 @@ function getQuestionsForLevel(levelId: string): ServerQuestion[] {
     if (combined.length >= 10) break;
     if (!combined.some((x) => x.id === q.id)) combined.push(q);
   }
-  return combined.slice(0, 10).sort(() => Math.random() - 0.5);
+  return shuffleArray(combined.slice(0, 10)).map((q) =>
+    q.type === 'mcq' && Array.isArray(q.options) ? { ...q, options: shuffleArray(q.options) } : q,
+  );
 }
 
 const BAD_WORDS = [
@@ -412,6 +423,7 @@ interface RoomMember {
   isLeader: boolean;
   score: number;
   answeredCount: number;
+  answeredIndices?: number[];
 }
 
 interface RoomState {
@@ -1377,9 +1389,32 @@ ${toneGuide}
         const member = room.members.find((m) => m.privateCode === sender.privateCode);
         if (!member) return;
 
-        const isCorrect = Boolean(msg.isCorrect);
-        const answeredCount = Math.min(room.questions.length, Number(msg.answeredCount || member.answeredCount + 1));
-        member.answeredCount = Math.max(member.answeredCount, answeredCount);
+        const answeredSet = new Set<number>(member.answeredIndices || []);
+        const rawIdx = Number.isFinite(Number(msg.questionIndex))
+          ? Number(msg.questionIndex)
+          : member.answeredCount;
+        const qIdx = Math.max(0, Math.min(room.questions.length - 1, rawIdx));
+        if (answeredSet.has(qIdx)) return; // Prevent double scoring same question index
+        answeredSet.add(qIdx);
+        member.answeredIndices = Array.from(answeredSet);
+
+        const qItem = room.questions[qIdx];
+        const norm = (val: string) =>
+          val
+            .toLowerCase()
+            .replace(/[.!?,،؟]/g, '')
+            .replace(/\s+/g, ' ')
+            .trim();
+        const isCorrect =
+          typeof msg.submittedAnswer === 'string' && qItem
+            ? norm(msg.submittedAnswer) === norm(qItem.answer)
+            : Boolean(msg.isCorrect);
+
+        const answeredCount = Math.min(
+          room.questions.length,
+          Math.max(member.answeredCount + 1, Number(msg.answeredCount || member.answeredCount + 1)),
+        );
+        member.answeredCount = answeredCount;
         if (isCorrect) member.score += 1;
 
         const allDone = room.members.every((m) => m.answeredCount >= room.questions.length);

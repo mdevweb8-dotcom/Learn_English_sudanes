@@ -8,6 +8,7 @@ import android.provider.Settings;
 import android.speech.tts.TextToSpeech;
 import android.speech.tts.UtteranceProgressListener;
 import android.webkit.JavascriptInterface;
+import android.webkit.WebSettings;
 import androidx.annotation.NonNull;
 import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
@@ -22,6 +23,7 @@ public class MainActivity extends BridgeActivity {
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
+        registerPlugin(LocalWifiMultiplayerPlugin.class);
         super.onCreate(savedInstanceState);
 
         tts = new TextToSpeech(this, status -> {
@@ -50,6 +52,8 @@ public class MainActivity extends BridgeActivity {
         });
 
         if (getBridge() != null && getBridge().getWebView() != null) {
+            WebSettings webSettings = getBridge().getWebView().getSettings();
+            webSettings.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
             getBridge().getWebView().addJavascriptInterface(new AndroidTTSBridge(), "AndroidTTS");
         }
     }
